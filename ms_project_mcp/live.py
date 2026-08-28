@@ -1841,7 +1841,7 @@ class LiveProjectBackend:
             raise MspError(ErrorCode.INVALID_REQUEST, "Microsoft Project save path must be an absolute .mpp path")
         if not target.parent.is_dir():
             raise MspError(ErrorCode.INVALID_REQUEST, "Microsoft Project save path parent directory does not exist")
-        normalized_target = os.path.normcase(os.path.abspath(str(target)))
+        normalized_target = os.path.normcase(os.path.abspath(str(target.resolve())))
         if target.exists() and (require_new or current != normalized_target):
             raise MspError(
                 ErrorCode.INVALID_REQUEST,
