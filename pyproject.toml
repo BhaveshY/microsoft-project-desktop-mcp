@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "microsoft-project-desktop-mcp"
+version = "0.1.0"
+description = "Safety-first MCP server for Microsoft Project Desktop on Windows."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "fastmcp==3.4.7",
+  "mcp==1.29.0",
+  "pydantic==2.13.4",
+  "pywin32==312; sys_platform == 'win32'",
+]
+
+[project.scripts]
+microsoft-project-mcp = "ms_project_mcp.server:main"
+
+[tool.setuptools.packages.find]
+include = ["ms_project_mcp*"]

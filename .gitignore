@@ -1,0 +1,8 @@
+.venv/
+.tmp/
+__pycache__/
+*.py[cod]
+*.sqlite3*
+build/
+dist/
+*.egg-info/
