@@ -30,6 +30,7 @@ from ms_project_mcp.models import (
     DeleteCalendar,
     DeleteResource,
     DeleteTask,
+    DesktopProjectDetection,
     ExportRequest,
     MoveTask,
     ObjectKind,
@@ -530,7 +531,15 @@ class HardenedContractTests(unittest.TestCase):
         self.assertEqual(stale.exception.code, ErrorCode.STALE_STATE)
 
     def test_auto_backend_is_unavailable_and_mock_requires_explicit_opt_in(self) -> None:
-        unavailable = create_backend({})
+        detection = DesktopProjectDetection(
+            platform="Test",
+            windows=False,
+            com_registered=False,
+            pywin32_importable=False,
+            pythoncom_importable=False,
+            win32com_importable=False,
+        )
+        unavailable = create_backend({}, detection=detection)
         self.assertIsInstance(unavailable, UnavailableProjectBackend)
         capabilities = unavailable.capabilities()
         self.assertFalse(capabilities.available)
@@ -554,9 +563,10 @@ class HardenedContractTests(unittest.TestCase):
                 "os.environ",
                 {"MSP_MCP_BACKEND": "auto", "MSP_MCP_STATE_DIR": state_dir},
             ):
-                with patch("builtins.__import__", side_effect=guarded_import):
-                    reloaded = importlib.reload(server_module)
-                result = reloaded.msp_capabilities()
+                with patch("ms_project_mcp.factory.probe_desktop_project", return_value=detection):
+                    with patch("builtins.__import__", side_effect=guarded_import):
+                        reloaded = importlib.reload(server_module)
+                    result = reloaded.msp_capabilities()
         self.assertFalse(result["result"]["available"])
 
 

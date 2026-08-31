@@ -160,6 +160,8 @@ class _FakeTasks(_ThreadChecked):
         task = _FakeTask(self._factory, uid, name)
         object.__setattr__(task, "_project", self._project)
         task.TaskDependencies = _FakeTaskDependencies(self._factory, self._project, task)
+        if hasattr(self._project, "Assignments"):
+            task.Assignments = self._project.Assignments
         if Before is None:
             self._items.append(task)
         else:
@@ -371,6 +373,11 @@ class _FakeAssignments(_ThreadChecked):
         return iter(self._items)
 
 
+class _ProjectAssignmentsTrap(_FakeAssignments):
+    def Add(self, *args, **kwargs):
+        raise AssertionError("Project.Assignments.Add must not be used")
+
+
 class _FakeShift(_ThreadChecked):
     def __init__(self, factory) -> None:
         super().__init__(factory)
@@ -473,6 +480,8 @@ class _FakeProject(_ThreadChecked):
         self.Resources._items.append(resource)
         object.__setattr__(resource, "_project", self)
         self.Assignments = _FakeAssignments(factory, self)
+        root.Assignments = self.Assignments
+        child.Assignments = self.Assignments
         assignment = _FakeAssignment(factory, child, resource)
         object.__setattr__(assignment, "_project", self)
         self.Assignments._items.append(assignment)
@@ -630,6 +639,9 @@ class _FakeApplication(_ThreadChecked):
         if created is not None and self._factory.force_created_parent_mismatch:
             created.OutlineParent = None
             created.OutlineLevel = 1
+        if created is not None and self._factory.force_created_root_parent_proxy:
+            created.OutlineParent = _FakeTask(self._factory, 0, "Project summary proxy")
+            created.OutlineLevel = 1
         if created is not None and self._factory.force_created_row_mismatch:
             tasks = self.ActiveProject.Tasks
             tasks._items.remove(created)
@@ -671,7 +683,19 @@ class _FakeApplication(_ThreadChecked):
         self._factory.schedule_calls.append(("reschedule", all_tasks, date_value, reschedule))
         return self._factory.update_project_result
 
-    def ProjectSummaryInfo(self, **kwargs):
+    def ProjectSummaryInfo(self, *args, **kwargs):
+        if kwargs:
+            raise AssertionError("ProjectSummaryInfo must use positional arguments")
+        self._factory.project_summary_calls.append(args)
+        if args:
+            import pythoncom
+
+            keys = ("Project", "Title", "Subject", "Author", "Company", "Manager", "Keywords", "Comments", "Start")
+            kwargs.update(
+                (key, value)
+                for key, value in zip(keys, args)
+                if key != "Project" and value is not pythoncom.Missing
+            )
         mapping = {
             "Title": "Title", "Subject": "Subject", "Company": "Company", "Manager": "Manager",
             "Comments": "ProjectNotes", "Start": "ProjectStart",
@@ -795,6 +819,7 @@ class _FakeAutomationFactory:
         self.outline_indent_calls: list[int] = []
         self.last_created_task = None
         self.force_created_parent_mismatch = False
+        self.force_created_root_parent_proxy = False
         self.force_created_row_mismatch = False
         self.selection_api_calls: list[str] = []
         self.export_calls: list[tuple[str, int]] = []
@@ -808,6 +833,7 @@ class _FakeAutomationFactory:
         self.file_close_types: list[tuple[str, int]] = []
         self.assignment_units_as_percentage = False
         self.assignment_add_units: list[float | None] = []
+        self.project_summary_calls: list[tuple] = []
         self.omit_explicit_baselines = False
         self.modal_prompt_attempted = False
         self.save_as_result = True
@@ -997,6 +1023,64 @@ class LiveProjectBackendTests(unittest.TestCase):
         self.assertEqual(factory.server_quit_count, 1)
         self.assertEqual(factory.user_quit_count, 0)
         self.assertIn(("server", 0), factory.file_close_types)
+
+    def test_project_summary_info_uses_positional_calls(self) -> None:
+        backend, factory, _ = self._backend()
+        session = backend.create_project(name="Positional title", path=None)
+        self.assertEqual(factory.project_summary_calls, [("Project", "Positional title")])
+        self._discard_and_shutdown(backend, session.project)
+
+    def test_assignments_use_task_collections(self) -> None:
+        backend, factory, host = self._backend()
+        session = backend.create_project(name="Task-owned assignments", path=None)
+
+        def reject_project_assignment_collection() -> None:
+            project = factory.server_app.ActiveProject
+            shared = project.Assignments
+            project.Assignments = _ProjectAssignmentsTrap(factory, project)
+            for task in project.Tasks:
+                task.Assignments = shared
+
+        host.call(reject_project_assignment_collection)
+        initial = backend.query(
+            session.project, QueryEntity.ASSIGNMENT, fields=(), limit=100, offset=0
+        ).items
+        self.assertEqual([item["ref"]["unique_id"] for item in initial], [41])
+
+        receipt = backend.apply_operations(
+            session.project,
+            (
+                CreateAssignment(
+                    client_ref="task-owned",
+                    task=ObjectRef(kind=ObjectKind.TASK, unique_id=22),
+                    resource=ObjectRef(kind=ObjectKind.RESOURCE, unique_id=31),
+                    units_percent=50,
+                ),
+            ),
+            idempotency_key="task-owned-assignment-0001",
+            verification=VerificationLevel.NATIVE_REREAD,
+            expected_state=session.state,
+        )
+        self.assertTrue(receipt.observed[0]["verified"])
+        self._discard_and_shutdown(backend, session.project)
+
+    def test_created_root_outline_parent_proxy_unique_id_zero_verifies_as_no_parent(self) -> None:
+        backend, factory, _ = self._backend()
+        session = backend.create_project(name="Root proxy", path=None)
+        factory.force_created_root_parent_proxy = True
+        receipt = backend.apply_operations(
+            session.project,
+            (CreateTask(client_ref="root-with-proxy", name="Top-level task"),),
+            idempotency_key="root-outline-parent-proxy-0001",
+            verification=VerificationLevel.NATIVE_REREAD,
+            expected_state=session.state,
+        )
+        self.assertTrue(receipt.observed[0]["verified"])
+        tasks = backend.query(session.project, QueryEntity.TASK, fields=(), limit=100, offset=0)
+        root = next(item for item in tasks.items if item["name"] == "Top-level task")
+        self.assertIsNone(root["parent_ref"])
+        self.assertEqual(backend.task_parent_edges(session.project), ((22, 11),))
+        self._discard_and_shutdown(backend, session.project)
 
     def test_numeric_enum_and_percent_mappings_are_publicly_stable(self) -> None:
         backend, _, _ = self._backend()

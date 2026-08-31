@@ -48,6 +48,14 @@ class DistributionTests(unittest.TestCase):
         self.assertNotIn("MSProject.Application", runner)
         self.assertNotIn("Dispatch", runner)
 
+        smoke_wrapper = (ROOT / "scripts" / "smoke-ms-project-desktop.ps1").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("$PreviousPythonPath = $env:PYTHONPATH", smoke_wrapper)
+        self.assertIn("$env:PYTHONPATH =", smoke_wrapper)
+        self.assertIn("Remove-Item Env:\\PYTHONPATH", smoke_wrapper)
+        self.assertIn("$env:PYTHONPATH = $PreviousPythonPath", smoke_wrapper)
+
     def test_desktop_smoke_refuses_without_consent_before_importing_live_adapter(self) -> None:
         smoke_source = (ROOT / "scripts" / "smoke-ms-project-desktop.py").read_text(encoding="utf-8")
         self.assertNotIn("run_id", smoke_source)

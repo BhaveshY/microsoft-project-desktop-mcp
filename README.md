@@ -194,10 +194,11 @@ and writes a disposable MPP fixture:
 powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\scripts\smoke-ms-project-desktop.ps1 -AllowWriteFixture
 ```
 
-The command prints JSON and leaves the unique fixture path for inspection. On
-this development PC, Microsoft Project is not installed, so the live desktop
-smoke remains **NOT VERIFIED**. Passing mocks and fake-COM tests are not reported
-as desktop proof.
+The command prints JSON and leaves the unique fixture path for inspection. A
+passing run verifies only the local Project installation that executed it. The
+live smoke has passed on Microsoft Project Standard 2019, version
+16.0.20326.20112, on 32-bit Office. Passing mocks and fake-COM tests are not
+reported as desktop proof.
 
 ## Official object-model grounding
 

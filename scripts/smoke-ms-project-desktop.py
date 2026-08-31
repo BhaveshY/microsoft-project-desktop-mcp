@@ -62,6 +62,7 @@ def main() -> int:
         StatusRequest,
         TaskProgressUpdate,
         TimephasedWorkUpdate,
+        UpdateProjectProperties,
     )
     from ms_project_mcp.service import ProjectService
 
@@ -126,6 +127,10 @@ def main() -> int:
                 resource=ObjectRef(kind=ObjectKind.RESOURCE, client_ref="engineer"),
                 units_percent=Decimal("100"),
             ),
+            UpdateProjectProperties(
+                title="Microsoft Project MCP Desktop Smoke Verified",
+                comments="Verified by the live Microsoft Project desktop smoke",
+            ),
         )
         receipt = service.apply(
             ApplyRequest(
@@ -161,13 +166,23 @@ def main() -> int:
             StatusRequest(
                 project=session.project,
                 expected_state=backend.current_state(session.project),
-                idempotency_key=_key("status"),
+                idempotency_key=_key("status-progress"),
                 mode=BatchMode.COMMIT,
                 updates=(
                     TaskProgressUpdate(
                         task=ObjectRef(kind=ObjectKind.TASK, unique_id=plan_task["ref"]["unique_id"]),
                         percent_complete=Decimal("25"),
                     ),
+                ),
+            )
+        )
+        service.status(
+            StatusRequest(
+                project=session.project,
+                expected_state=backend.current_state(session.project),
+                idempotency_key=_key("status-timephased"),
+                mode=BatchMode.COMMIT,
+                updates=(
                     TimephasedWorkUpdate(
                         assignment=ObjectRef(
                             kind=ObjectKind.ASSIGNMENT,
@@ -215,11 +230,19 @@ def main() -> int:
             raise RuntimeError("reopened task names did not match")
         if len(reopened_dependencies.items) < 1 or len(reopened_assignments.items) < 1:
             raise RuntimeError("reopened dependencies or assignments were missing")
+        reopened_saved = service.project(
+            ProjectRequest(
+                action=ProjectAction.SAVE,
+                project=reopened.project,
+                expected_state=backend.current_state(reopened.project),
+                idempotency_key=_key("reopen-save"),
+            )
+        )
         service.project(
             ProjectRequest(
                 action=ProjectAction.CLOSE,
                 project=reopened.project,
-                expected_state=reopened_tasks.state,
+                expected_state=reopened_saved.state,
                 idempotency_key=_key("reopen-close"),
                 close_disposition=CloseDisposition.REFUSE_IF_DIRTY,
             )

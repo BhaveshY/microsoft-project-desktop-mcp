@@ -218,7 +218,7 @@ class LiveProjectBackend:
                 # in documented summary metadata; SaveAs supplies the physical
                 # file name when a path was requested.
                 project.Activate()
-                self._invoke(lambda: app.ProjectSummaryInfo(Title=name))
+                self._invoke(lambda: app.ProjectSummaryInfo(self._text(project.Name), name))
             session = self._bind(app, project, Ownership.SERVER_OWNED)
             if validated_path:
                 try:
@@ -766,10 +766,11 @@ class LiveProjectBackend:
         collections = {
             ObjectKind.TASK: "Tasks",
             ObjectKind.RESOURCE: "Resources",
-            ObjectKind.ASSIGNMENT: "Assignments",
         }
         if ref.kind == ObjectKind.CALENDAR:
             collection = self._calendar_collection(project)
+        elif ref.kind == ObjectKind.ASSIGNMENT:
+            collection = self._assignment_objects(project)
         elif ref.kind in collections:
             collection = self._read(project, collections[ref.kind], ())
         else:
@@ -1159,10 +1160,10 @@ class LiveProjectBackend:
         if isinstance(operation, CreateAssignment):
             task = self._resolve_native(project, operation.task, local)
             resource = self._resolve_native(project, operation.resource, local)
-            # Assignments.Add is documented in terms of TaskID/ResourceID. These transient
-            # IDs are consumed only here after resolving the public stable UniqueID refs.
+            # Assignments collections belong to tasks or resources, not Project. The
+            # transient IDs are consumed only here after resolving stable UniqueID refs.
             assignment = self._invoke(
-                lambda: project.Assignments.Add(int(task.ID), int(resource.ID))
+                lambda: task.Assignments.Add(int(task.ID), int(resource.ID))
             )
             resource_type = ResourceType(self._mapped_enum(resource.Type, _RESOURCE_TYPE_FROM_NATIVE))
             if resource_type == ResourceType.COST:
@@ -1253,10 +1254,9 @@ class LiveProjectBackend:
             return (ObjectKind.CALENDAR, guid)
         if isinstance(operation, UpdateProjectProperties):
             self._activate_session(session)
-            kwargs = {
+            values = {
                 key: value
                 for key, value in {
-                    "Project": self._text(self._read(project, "FullName", "")) or self._text(project.Name),
                     "Title": operation.title,
                     "Subject": operation.subject,
                     "Company": operation.company,
@@ -1266,7 +1266,12 @@ class LiveProjectBackend:
                 }.items()
                 if value is not None
             }
-            self._invoke(lambda: session.app.ProjectSummaryInfo(**kwargs))
+            project_name = self._text(self._read(project, "FullName", "")) or self._text(project.Name)
+            keys = ("Title", "Subject", "Author", "Company", "Manager", "Keywords", "Comments", "Start")
+            last = max(index for index, key in enumerate(keys) if key in values)
+            missing = importlib.import_module("pythoncom").Missing
+            args = (project_name,) + tuple(values.get(key, missing) for key in keys[: last + 1])
+            self._invoke(lambda: session.app.ProjectSummaryInfo(*args))
             if operation.comments is not None:
                 project.ProjectNotes = operation.comments
             return project
@@ -1489,9 +1494,17 @@ class LiveProjectBackend:
                     ObjectRef(kind=ObjectKind.TASK, unique_id=uid),
                 )
                 parent = self._read(reread, "OutlineParent", None)
-                parent_uid = int(parent.UniqueID) if parent is not None else None
+                parent_uid_value = (
+                    int(self._number(self._read(parent, "UniqueID", 0), 0))
+                    if parent is not None
+                    else 0
+                )
+                parent_uid = parent_uid_value or None
                 if parent_uid != placement.parent_unique_id:
-                    raise _RereadMismatch("Created task parent did not match")
+                    raise _RereadMismatch(
+                        f"Created task parent did not match for {operation.name}: "
+                        f"expected {placement.parent_unique_id}, observed {parent_uid}"
+                    )
                 ordered = self._iter(self._read(project, "Tasks", ()))
                 positions = {int(task.UniqueID): index for index, task in enumerate(ordered)}
                 position = positions[uid]
@@ -1625,7 +1638,10 @@ class LiveProjectBackend:
                 actual = self._date_value(raw) if isinstance(requested, datetime) else self._number(raw)
                 expected = self._date_value(requested) if isinstance(requested, datetime) else float(requested)
                 if actual != expected:
-                    raise _RereadMismatch(f"Task progress field {public_name} did not match")
+                    raise _RereadMismatch(
+                        f"Task progress field {public_name} did not match: "
+                        f"expected {expected}, observed {actual}"
+                    )
                 values[public_name] = actual
             observations.append({"op": update.op, "native": values})
         return observations
@@ -2110,7 +2126,7 @@ class LiveProjectBackend:
 
     def _assignments(self, project: Any) -> list[dict[str, Any]]:
         items = []
-        for assignment in self._iter(self._read(project, "Assignments", ())):
+        for assignment in self._assignment_objects(project):
             uid = int(self._read(assignment, "UniqueID"))
             task = self._read(assignment, "Task")
             resource = self._read(assignment, "Resource")
@@ -2140,6 +2156,17 @@ class LiveProjectBackend:
                 }
             )
         return sorted(items, key=lambda item: item["ref"]["unique_id"])
+
+    def _assignment_objects(self, project: Any) -> list[Any]:
+        assignments: list[Any] = []
+        seen: set[int] = set()
+        for task in self._iter(self._read(project, "Tasks", ())):
+            for assignment in self._iter(self._read(task, "Assignments", ())):
+                uid = int(self._read(assignment, "UniqueID", 0))
+                if uid and uid not in seen:
+                    seen.add(uid)
+                    assignments.append(assignment)
+        return assignments
 
     def _calendars(self, project: Any) -> list[dict[str, Any]]:
         items = []
