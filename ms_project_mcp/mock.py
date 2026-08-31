@@ -81,6 +81,16 @@ class _Task:
     after_id: int | None
     fixed_cost: Decimal
     cost_accrual: str
+    constraint_type: str = "as_soon_as_possible"
+    constraint_date: datetime | None = None
+    deadline: datetime | None = None
+    task_type: str | None = None
+    effort_driven: bool | None = None
+    manual: bool | None = None
+    priority: int | None = None
+    notes: str | None = None
+    calendar_id: int | None = None
+    ignore_resource_calendar: bool | None = None
     percent_complete: Decimal = Decimal("0")
     actual_duration_minutes: int | None = None
     remaining_duration_minutes: int | None = None
@@ -100,6 +110,13 @@ class _Resource:
     overtime_rate_per_hour: Decimal
     cost_per_use: Decimal
     material_label: str | None
+    cost_accrual: str
+    initials: str | None = None
+    group: str | None = None
+    code: str | None = None
+    email: str | None = None
+    notes: str | None = None
+    base_calendar_id: int | None = None
 
 
 @dataclass
@@ -213,7 +230,9 @@ class MockProjectBackend:
         self._projects[session_id] = _Project(ref=ref, ownership=ownership, name=name, path=path)
         return self.get_session(ref)
 
-    def create_project(self, *, name: str, path: str | None) -> ProjectSession:
+    def create_project(
+        self, *, name: str, path: str | None, template_path: str | None = None
+    ) -> ProjectSession:
         return self._new_project(name, path, Ownership.SERVER_OWNED)
 
     def open_project(self, *, path: str) -> ProjectSession:
@@ -322,11 +341,36 @@ class MockProjectBackend:
 
     def _task_item(self, item: _Task) -> dict[str, Any]:
         data = self._json(vars(item))
+        calendar_id = data.pop("calendar_id")
+        constraint_name = data.pop("constraint_type")
+        constraint_types = {
+            "as_soon_as_possible": 0,
+            "as_late_as_possible": 1,
+            "must_start_on": 2,
+            "must_finish_on": 3,
+            "start_no_earlier_than": 4,
+            "start_no_later_than": 5,
+            "finish_no_earlier_than": 6,
+            "finish_no_later_than": 7,
+        }
+        data["constraint_type"] = constraint_types[constraint_name]
+        data["constraint_type_name"] = constraint_name
+        data["calendar_ref"] = (
+            ObjectRef(kind=ObjectKind.CALENDAR, unique_id=calendar_id).model_dump(mode="json")
+            if calendar_id is not None
+            else None
+        )
         data["ref"] = ObjectRef(kind=ObjectKind.TASK, unique_id=item.unique_id).model_dump(mode="json")
         return data
 
     def _resource_item(self, item: _Resource) -> dict[str, Any]:
         data = self._json(vars(item))
+        calendar_id = data.pop("base_calendar_id")
+        data["base_calendar_ref"] = (
+            ObjectRef(kind=ObjectKind.CALENDAR, unique_id=calendar_id).model_dump(mode="json")
+            if calendar_id is not None
+            else None
+        )
         data["resource_type"] = item.resource_type.value
         data["standard_rate_basis"] = (
             "hour" if item.resource_type == ResourceType.WORK
@@ -497,6 +541,20 @@ class MockProjectBackend:
                         resolve(operation.after) if operation.after else None,
                         operation.fixed_cost,
                         operation.cost_accrual.value,
+                        constraint_type=(
+                            operation.constraint_type.value
+                            if operation.constraint_type is not None
+                            else "as_soon_as_possible"
+                        ),
+                        constraint_date=operation.constraint_date,
+                        deadline=operation.deadline,
+                        task_type=operation.task_type.value if operation.task_type is not None else None,
+                        effort_driven=operation.effort_driven,
+                        manual=operation.manual,
+                        priority=operation.priority,
+                        notes=operation.notes,
+                        calendar_id=resolve(operation.calendar) if operation.calendar else None,
+                        ignore_resource_calendar=operation.ignore_resource_calendar,
                     )
                     local[(ObjectKind.TASK, operation.client_ref)] = uid
                     observation.update(
@@ -514,6 +572,25 @@ class MockProjectBackend:
                             setattr(task, name, value)
                     if operation.cost_accrual is not None:
                         task.cost_accrual = operation.cost_accrual.value
+                    if operation.constraint_type is not None:
+                        task.constraint_type = operation.constraint_type.value
+                        task.constraint_date = operation.constraint_date
+                    if operation.deadline is not None or operation.clear_deadline:
+                        task.deadline = operation.deadline
+                    if operation.task_type is not None:
+                        task.task_type = operation.task_type.value
+                    for name in (
+                        "effort_driven",
+                        "manual",
+                        "priority",
+                        "notes",
+                        "ignore_resource_calendar",
+                    ):
+                        value = getattr(operation, name)
+                        if value is not None:
+                            setattr(task, name, value)
+                    if operation.calendar is not None or operation.clear_calendar:
+                        task.calendar_id = resolve(operation.calendar) if operation.calendar else None
                     if operation.duration_minutes is not None:
                         task.milestone = operation.duration_minutes == 0
                 elif isinstance(operation, MoveTask):
@@ -551,6 +628,13 @@ class MockProjectBackend:
                         operation.overtime_rate_per_hour,
                         operation.cost_per_use,
                         operation.material_label,
+                        operation.cost_accrual.value,
+                        operation.initials,
+                        operation.group,
+                        operation.code,
+                        operation.email,
+                        operation.notes,
+                        resolve(operation.base_calendar) if operation.base_calendar else None,
                     )
                     local[(ObjectKind.RESOURCE, operation.client_ref)] = uid
                     observation.update(
@@ -569,10 +653,19 @@ class MockProjectBackend:
                         "overtime_rate_per_hour",
                         "cost_per_use",
                         "material_label",
+                        "initials",
+                        "group",
+                        "code",
+                        "email",
+                        "notes",
                     ):
                         value = getattr(operation, name)
                         if value is not None:
                             setattr(resource, name, value)
+                    if operation.cost_accrual is not None:
+                        resource.cost_accrual = operation.cost_accrual.value
+                    if operation.base_calendar is not None:
+                        resource.base_calendar_id = resolve(operation.base_calendar)
                 elif isinstance(operation, DeleteResource):
                     uid = resolve(operation.resource)
                     if any(assignment.resource_id == uid for assignment in stored.assignments.values()):
@@ -649,7 +742,15 @@ class MockProjectBackend:
                         raise MspError(ErrorCode.INVALID_REQUEST, "A base calendar in use cannot be deleted")
                     del stored.calendars[uid]
                 elif isinstance(operation, UpdateProjectProperties):
-                    stored.properties.update(operation.model_dump(mode="json", exclude={"op"}, exclude_none=True))
+                    values = operation.model_dump(
+                        mode="json", exclude={"op", "calendar"}, exclude_none=True
+                    )
+                    if operation.calendar is not None:
+                        values["calendar_ref"] = ObjectRef(
+                            kind=ObjectKind.CALENDAR,
+                            unique_id=resolve(operation.calendar),
+                        ).model_dump(mode="json")
+                    stored.properties.update(values)
                 elif isinstance(operation, SetBaseline):
                     stored.baselines.add(operation.baseline)
                 elif isinstance(operation, ClearBaseline):

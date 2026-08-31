@@ -47,8 +47,10 @@ def main() -> int:
         BatchMode,
         CloseDisposition,
         CreateAssignment,
+        CreateCalendar,
         CreateResource,
         CreateTask,
+        DeleteTask,
         ObjectKind,
         ObjectRef,
         OperationBatch,
@@ -60,9 +62,13 @@ def main() -> int:
         ScheduleCommand,
         ScheduleRequest,
         StatusRequest,
+        TaskConstraintType,
         TaskProgressUpdate,
+        TaskType,
         TimephasedWorkUpdate,
         UpdateProjectProperties,
+        UpdateResource,
+        UpdateTask,
     )
     from ms_project_mcp.service import ProjectService
 
@@ -97,12 +103,23 @@ def main() -> int:
 
         stage = "build"
         operations = (
+            CreateCalendar(client_ref="delivery-calendar", name="Delivery Calendar"),
             CreateTask(client_ref="summary", name="Desktop smoke", duration_minutes=0),
             CreateTask(
                 client_ref="plan",
                 name="Plan",
                 duration_minutes=480,
                 parent=ObjectRef(kind=ObjectKind.TASK, client_ref="summary"),
+                constraint_type=TaskConstraintType.START_NO_EARLIER_THAN,
+                constraint_date=datetime(2027, 1, 4, 8, 0),
+                deadline=datetime(2027, 1, 15, 17, 0),
+                task_type=TaskType.FIXED_DURATION,
+                effort_driven=False,
+                manual=False,
+                priority=700,
+                notes="Advanced planning controls verified",
+                calendar=ObjectRef(kind=ObjectKind.CALENDAR, client_ref="delivery-calendar"),
+                ignore_resource_calendar=True,
             ),
             CreateTask(
                 client_ref="deliver",
@@ -110,6 +127,16 @@ def main() -> int:
                 duration_minutes=960,
                 parent=ObjectRef(kind=ObjectKind.TASK, client_ref="summary"),
                 after=ObjectRef(kind=ObjectKind.TASK, client_ref="plan"),
+            ),
+            CreateTask(client_ref="disposable", name="Disposable summary", duration_minutes=0),
+            CreateTask(
+                client_ref="disposable-child",
+                name="Disposable child",
+                parent=ObjectRef(kind=ObjectKind.TASK, client_ref="disposable"),
+                deadline=datetime(2027, 1, 8, 17, 0),
+                calendar=ObjectRef(
+                    kind=ObjectKind.CALENDAR, client_ref="delivery-calendar"
+                ),
             ),
             AddDependency(
                 predecessor=ObjectRef(kind=ObjectKind.TASK, client_ref="plan"),
@@ -120,6 +147,12 @@ def main() -> int:
                 name="Smoke Engineer",
                 resource_type=ResourceType.WORK,
                 max_units_percent=Decimal("100"),
+                initials="SE",
+                group="Delivery",
+                code="SMOKE-01",
+                email="smoke@example.com",
+                notes="Advanced resource details verified",
+                base_calendar=ObjectRef(kind=ObjectKind.CALENDAR, client_ref="delivery-calendar"),
             ),
             CreateAssignment(
                 client_ref="plan-owner",
@@ -130,6 +163,16 @@ def main() -> int:
             UpdateProjectProperties(
                 title="Microsoft Project MCP Desktop Smoke Verified",
                 comments="Verified by the live Microsoft Project desktop smoke",
+                author="Microsoft Project MCP",
+                keywords="MCP, verification",
+                calendar=ObjectRef(kind=ObjectKind.CALENDAR, client_ref="delivery-calendar"),
+                default_task_type=TaskType.FIXED_DURATION,
+                default_effort_driven=False,
+                new_tasks_manual=False,
+                honor_constraints=True,
+                multiple_critical_paths=True,
+                hours_per_day=Decimal("8"),
+                hours_per_week=Decimal("40"),
             ),
         )
         receipt = service.apply(
@@ -140,6 +183,83 @@ def main() -> int:
                     expected_state=session.state,
                     idempotency_key=_key("build"),
                     mode=BatchMode.COMMIT,
+                ),
+            )
+        )
+
+        stage = "modify"
+        built_tasks = service.query(QueryRequest(project=session.project, entity=QueryEntity.TASK))
+        built_resources = service.query(
+            QueryRequest(project=session.project, entity=QueryEntity.RESOURCE)
+        )
+        disposable_child = next(
+            item for item in built_tasks.items if item["name"] == "Disposable child"
+        )
+        engineer = next(
+            item for item in built_resources.items if item["name"] == "Smoke Engineer"
+        )
+        receipt = service.apply(
+            ApplyRequest(
+                project=session.project,
+                batch=OperationBatch(
+                    operations=(
+                        UpdateTask(
+                            task=ObjectRef(
+                                kind=ObjectKind.TASK,
+                                unique_id=disposable_child["ref"]["unique_id"],
+                            ),
+                            clear_deadline=True,
+                            clear_calendar=True,
+                            notes="Updated before recursive deletion",
+                        ),
+                        UpdateResource(
+                            resource=ObjectRef(
+                                kind=ObjectKind.RESOURCE,
+                                unique_id=engineer["ref"]["unique_id"],
+                            ),
+                            group="Delivery Operations",
+                            email="delivery-smoke@example.com",
+                        ),
+                    ),
+                    expected_state=receipt.state_after,
+                    idempotency_key=_key("modify"),
+                    mode=BatchMode.COMMIT,
+                ),
+            )
+        )
+
+        stage = "recursive_delete"
+        disposable = next(item for item in built_tasks.items if item["name"] == "Disposable summary")
+        delete_operations = (
+            DeleteTask(
+                task=ObjectRef(
+                    kind=ObjectKind.TASK,
+                    unique_id=disposable["ref"]["unique_id"],
+                ),
+                recursive=True,
+            ),
+        )
+        delete_key = _key("recursive-delete")
+        delete_plan = service.apply(
+            ApplyRequest(
+                project=session.project,
+                batch=OperationBatch(
+                    operations=delete_operations,
+                    expected_state=receipt.state_after,
+                    idempotency_key=delete_key,
+                    mode=BatchMode.PLAN,
+                ),
+            )
+        )
+        receipt = service.apply(
+            ApplyRequest(
+                project=session.project,
+                batch=OperationBatch(
+                    operations=delete_operations,
+                    expected_state=receipt.state_after,
+                    idempotency_key=delete_key,
+                    mode=BatchMode.COMMIT,
+                    confirmation_token=delete_plan.confirmation_token,
                 ),
             )
         )
@@ -225,11 +345,44 @@ def main() -> int:
         reopened_assignments = service.query(
             QueryRequest(project=reopened.project, entity=QueryEntity.ASSIGNMENT)
         )
+        reopened_resources = service.query(
+            QueryRequest(project=reopened.project, entity=QueryEntity.RESOURCE)
+        )
+        reopened_project = service.query(
+            QueryRequest(project=reopened.project, entity=QueryEntity.PROJECT)
+        )
         names = {item["name"] for item in reopened_tasks.items}
         if not {"Desktop smoke", "Plan", "Deliver"}.issubset(names):
             raise RuntimeError("reopened task names did not match")
         if len(reopened_dependencies.items) < 1 or len(reopened_assignments.items) < 1:
             raise RuntimeError("reopened dependencies or assignments were missing")
+        reopened_plan = next(item for item in reopened_tasks.items if item["name"] == "Plan")
+        reopened_engineer = next(
+            item for item in reopened_resources.items if item["name"] == "Smoke Engineer"
+        )
+        project_item = reopened_project.items[0]
+        if (
+            reopened_plan["constraint_type_name"]
+            != TaskConstraintType.START_NO_EARLIER_THAN.value
+            or reopened_plan["constraint_date"] != datetime(2027, 1, 4, 8, 0).isoformat()
+            or reopened_plan["deadline"] != datetime(2027, 1, 15, 17, 0).isoformat()
+            or reopened_plan["task_type"] != TaskType.FIXED_DURATION.value
+            or reopened_plan["effort_driven"] is not False
+            or reopened_plan["manual"] is not False
+            or reopened_plan["priority"] != 700
+            or reopened_plan["calendar_ref"] is None
+            or reopened_engineer["base_calendar_ref"] is None
+            or reopened_engineer["code"] != "SMOKE-01"
+            or reopened_engineer["group"] != "Delivery Operations"
+            or reopened_engineer["email"] != "delivery-smoke@example.com"
+            or project_item["calendar_ref"] is None
+            or project_item["default_task_type"] != TaskType.FIXED_DURATION.value
+            or project_item["new_tasks_manual"] is not False
+            or project_item["multiple_critical_paths"] is not True
+            or project_item["author"] != "Microsoft Project MCP"
+            or project_item["keywords"] != "MCP, verification"
+        ):
+            raise RuntimeError("reopened advanced planning fields did not match")
         reopened_saved = service.project(
             ProjectRequest(
                 action=ProjectAction.SAVE,
@@ -248,6 +401,34 @@ def main() -> int:
             )
         )
         open_refs.remove(reopened.project)
+
+        stage = "template_create"
+        template_fixture = fixture_dir / "desktop-smoke-from-template.mpp"
+        templated = service.project(
+            ProjectRequest(
+                action=ProjectAction.CREATE,
+                name="Microsoft Project MCP Template Smoke",
+                path=str(template_fixture),
+                template_path=str(fixture),
+                idempotency_key=_key("template-create"),
+            )
+        )
+        open_refs.append(templated.project)
+        templated_tasks = service.query(
+            QueryRequest(project=templated.project, entity=QueryEntity.TASK)
+        )
+        if "Plan" not in {item["name"] for item in templated_tasks.items}:
+            raise RuntimeError("template-created project did not contain the source tasks")
+        service.project(
+            ProjectRequest(
+                action=ProjectAction.CLOSE,
+                project=templated.project,
+                expected_state=backend.current_state(templated.project),
+                idempotency_key=_key("template-close"),
+                close_disposition=CloseDisposition.SAVE_AND_CLOSE,
+            )
+        )
+        open_refs.remove(templated.project)
         _print(
             {
                 "status": "VERIFIED",
@@ -255,6 +436,9 @@ def main() -> int:
                 "task_count": len(reopened_tasks.items),
                 "dependency_count": len(reopened_dependencies.items),
                 "assignment_count": len(reopened_assignments.items),
+                "advanced_planning": True,
+                "recursive_delete": True,
+                "template_create": True,
             }
         )
         return 0

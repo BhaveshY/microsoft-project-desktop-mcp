@@ -61,7 +61,9 @@ class UnavailableProjectBackend:
     def _unavailable(self) -> NoReturn:
         raise MspError(ErrorCode.BACKEND_UNAVAILABLE, self.reason, retryable=False)
 
-    def create_project(self, *, name: str, path: str | None) -> ProjectSession:
+    def create_project(
+        self, *, name: str, path: str | None, template_path: str | None = None
+    ) -> ProjectSession:
         self._unavailable()
 
     def open_project(self, *, path: str) -> ProjectSession:

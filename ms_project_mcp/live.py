@@ -51,12 +51,15 @@ from .models import (
     QueryEntity,
     RemoveDependency,
     ResourceType,
+    ScheduleFrom,
     ScheduleCommand,
     ScheduleOptions,
     SetBaseline,
     SetStatusDate,
     StatusOperation,
     TaskProgressUpdate,
+    TaskConstraintType,
+    TaskType,
     TimephasedWorkUpdate,
     UpdateAssignment,
     UpdateCalendar,
@@ -122,6 +125,21 @@ _COST_ACCRUAL_FROM_NATIVE = {1: "start", 2: "end", 3: "prorated"}
 _COST_ACCRUAL_TO_NATIVE = {value: key for key, value in _COST_ACCRUAL_FROM_NATIVE.items()}
 _COST_RATE_FROM_NATIVE = {0: "A", 1: "B", 2: "C", 3: "D", 4: "E"}
 _COST_RATE_TO_NATIVE = {value: key for key, value in _COST_RATE_FROM_NATIVE.items()}
+_TASK_TYPE_FROM_NATIVE = {0: "fixed_units", 1: "fixed_duration", 2: "fixed_work"}
+_TASK_TYPE_TO_NATIVE = {value: key for key, value in _TASK_TYPE_FROM_NATIVE.items()}
+_TASK_CONSTRAINT_FROM_NATIVE = {
+    0: "as_soon_as_possible",
+    1: "as_late_as_possible",
+    2: "must_start_on",
+    3: "must_finish_on",
+    4: "start_no_earlier_than",
+    5: "start_no_later_than",
+    6: "finish_no_earlier_than",
+    7: "finish_no_later_than",
+}
+_TASK_CONSTRAINT_TO_NATIVE = {value: key for key, value in _TASK_CONSTRAINT_FROM_NATIVE.items()}
+_SCHEDULE_FROM_NATIVE = {1: "start", 2: "finish"}
+_SCHEDULE_TO_NATIVE = {value: key for key, value in _SCHEDULE_FROM_NATIVE.items()}
 _BASELINE_INTO = {0: 0, **{index: index + 10 for index in range(1, 11)}}
 _WEEKDAY_TO_NATIVE = {
     Weekday.SUNDAY: 1,
@@ -146,7 +164,7 @@ class LiveProjectBackend:
         detection: DesktopProjectDetection | None = None,
         sta_host: StaHost | None = None,
         automation_factory_provider: Callable[[], AutomationFactory] = load_automation_factory,
-        call_timeout: float | None = 30.0,
+        call_timeout: float | None = 120.0,
         server_app_visible: bool = True,
         instance_namespace: str | None = None,
     ) -> None:
@@ -178,15 +196,19 @@ class LiveProjectBackend:
             activates_desktop=False,
             supported_tools=TOOL_NAMES,
             supported_operations=(
-                "create_task:parent_after", "update_task", "delete_task:non_recursive",
-                "create_resource", "update_resource", "delete_resource",
+                "create_task:parent_after", "create_task:advanced_planning", "update_task",
+                "update_task:advanced_planning",
+                "delete_task:non_recursive", "delete_task:recursive",
+                "create_resource:details_calendar",
+                "update_resource:details_calendar", "delete_resource",
                 "create_assignment", "update_assignment", "delete_assignment",
-                "add_dependency", "remove_dependency", "update_project_properties",
+                "add_dependency", "remove_dependency", "update_project_properties:scheduling",
                 "create_calendar", "update_calendar", "delete_calendar",
                 "set_baseline", "clear_baseline", "schedule:calculate", "schedule:level",
                 "schedule:clear_leveling", "schedule:reschedule", "status:task_progress",
                 "status:set_status_date", "status:timephased_actual_work_daily",
                 "analyze", "export:pdf", "export:mpp",
+                "project:create_from_template",
             ),
             safety_classes={
                 "msp_capabilities": "read_only",
@@ -200,19 +222,26 @@ class LiveProjectBackend:
             },
             notes=(
                 "Live writes use state checks inside the owning STA immediately before mutation",
-                "Task creation supports stable parent/after placement; existing task moves remain unsupported",
+                "Task creation supports advanced scheduling and stable parent/after placement; physical row moves remain unsupported",
                 "Daily assignment actual work uses native timephased buckets with exact reread verification",
                 "Capabilities probing does not activate Microsoft Project",
             ),
             detection=self.detection,
         )
 
-    def create_project(self, *, name: str, path: str | None) -> ProjectSession:
+    def create_project(
+        self, *, name: str, path: str | None, template_path: str | None = None
+    ) -> ProjectSession:
         validated_path = self._validated_save_target(path, current="", require_new=True) if path else None
+        validated_template = self._validated_template_target(template_path) if template_path else None
 
         def create() -> ProjectSession:
             app = self._server_application()
-            project = self._invoke(app.Projects.Add)
+            project = self._invoke(
+                (lambda: app.Projects.Add(False, validated_template, False))
+                if validated_template
+                else app.Projects.Add
+            )
             if name:
                 # Project.Name is read-only. Preserve the requested logical label
                 # in documented summary metadata; SaveAs supplies the physical
@@ -413,8 +442,10 @@ class LiveProjectBackend:
             mutation_possible = False
             local: dict[tuple[ObjectKind, str], Any] = {}
             touched: list[tuple[Operation, Any]] = []
+            active_operation: Operation | None = None
             try:
                 for operation in operations:
+                    active_operation = operation
                     mutation_possible = True
                     native = self._apply_one_on_sta(session, operation, local)
                     touched.append((operation, native))
@@ -427,10 +458,13 @@ class LiveProjectBackend:
                 self._activate_session(session)
                 self._invoke(app.CloseUndoTransaction)
                 undo_open = False
-                observed = tuple(
-                    self._verify_operation_on_sta(session, operation, native, local)
-                    for operation, native in touched
-                )
+                observed_items = []
+                for operation, native in touched:
+                    active_operation = operation
+                    observed_items.append(
+                        self._verify_operation_on_sta(session, operation, native, local)
+                    )
+                observed = tuple(observed_items)
                 state_after = self._state_on_sta(session)
             except Exception as exc:
                 if undo_open:
@@ -449,7 +483,13 @@ class LiveProjectBackend:
                     raise BackendExecutionError(
                         "Microsoft Project write failed and rollback could not be verified",
                         dispatch_state=DispatchState.MAY_HAVE_DISPATCHED,
-                        details={"cause": type(exc).__name__, "rollback_cause": type(rollback_exc).__name__},
+                        details={
+                            "cause": type(exc).__name__,
+                            "cause_message": str(exc),
+                            "operation": active_operation.op if active_operation else None,
+                            "operation_ref": getattr(active_operation, "client_ref", None),
+                            "rollback_cause": type(rollback_exc).__name__,
+                        },
                     ) from exc
                 if restored:
                     code = ErrorCode.VERIFICATION_FAILED if isinstance(exc, _RereadMismatch) else ErrorCode.WRITE_ROLLED_BACK
@@ -457,12 +497,22 @@ class LiveProjectBackend:
                         code,
                         "Microsoft Project rejected or failed verification of the batch; the undo restored the original state",
                         retryable=True,
-                        details={"cause": type(exc).__name__},
+                        details={
+                            "cause": type(exc).__name__,
+                            "cause_message": str(exc),
+                            "operation": active_operation.op if active_operation else None,
+                            "operation_ref": getattr(active_operation, "client_ref", None),
+                        },
                     ) from exc
                 raise BackendExecutionError(
                     "Microsoft Project write failed and rollback state is uncertain",
                     dispatch_state=DispatchState.MAY_HAVE_DISPATCHED,
-                    details={"cause": type(exc).__name__},
+                    details={
+                        "cause": type(exc).__name__,
+                        "cause_message": str(exc),
+                        "operation": active_operation.op if active_operation else None,
+                        "operation_ref": getattr(active_operation, "client_ref", None),
+                    },
                 ) from exc
             return ChangeReceipt(
                 receipt_id=f"live:{hashlib.sha256(idempotency_key.encode()).hexdigest()[:24]}",
@@ -821,7 +871,7 @@ class LiveProjectBackend:
             if isinstance(operation, unsupported_types):
                 raise MspError(ErrorCode.UNSUPPORTED_OPERATION, f"Live {operation.op} is not safely supported")
             if isinstance(operation, CreateTask):
-                for ref in (operation.parent, operation.after):
+                for ref in (operation.parent, operation.after, operation.calendar):
                     if ref is not None:
                         check(ref)
                 parent_key = task_key(operation.parent) if operation.parent is not None else None
@@ -840,6 +890,8 @@ class LiveProjectBackend:
                 earlier.add((ObjectKind.TASK, operation.client_ref))
                 task_parents[f"client:{operation.client_ref}"] = parent_key
             elif isinstance(operation, CreateResource):
+                if operation.base_calendar is not None:
+                    check(operation.base_calendar)
                 earlier.add((ObjectKind.RESOURCE, operation.client_ref))
                 created_resource_types[operation.client_ref] = operation.resource_type
             elif isinstance(operation, CreateCalendar):
@@ -890,22 +942,53 @@ class LiveProjectBackend:
                 created_assignment_resource_types[operation.client_ref] = resource_type
             elif isinstance(operation, (UpdateTask, DeleteTask)):
                 check(operation.task)
+                if isinstance(operation, UpdateTask) and operation.calendar is not None:
+                    check(operation.calendar)
                 if isinstance(operation, DeleteTask):
-                    if operation.recursive:
-                        raise MspError(ErrorCode.UNSUPPORTED_OPERATION, "Recursive live task deletion is not supported")
                     target_key = task_key(operation.task)
                     native_summary = False
                     if operation.task.client_ref is None:
                         native_task = self._resolve_native(session.project, operation.task)
                         native_summary = bool(self._read(native_task, "Summary", False))
-                    if native_summary or any(parent == target_key for parent in task_parents.values()):
+                    if (
+                        native_summary or any(parent == target_key for parent in task_parents.values())
+                    ) and not operation.recursive:
                         raise MspError(
                             ErrorCode.UNSUPPORTED_OPERATION,
-                            "Deleting a summary task is not supported because Project also deletes its subtasks",
+                            "Deleting a summary task requires recursive=true",
                         )
+                    if operation.recursive and operation.task.client_ref is None:
+                        native_tasks = self._iter(self._read(session.project, "Tasks", ()))
+                        target_index = next(
+                            index
+                            for index, item in enumerate(native_tasks)
+                            if int(item.UniqueID) == int(native_task.UniqueID)
+                        )
+                        target_level = int(
+                            self._number(self._read(native_task, "OutlineLevel", 1), 1)
+                        )
+                        subtree = [native_task]
+                        for child in native_tasks[target_index + 1 :]:
+                            child_level = int(
+                                self._number(self._read(child, "OutlineLevel", 1), 1)
+                            )
+                            if child_level <= target_level:
+                                break
+                            subtree.append(child)
+                        if any(
+                            bool(self._read(item, "ExternalTask", False))
+                            or bool(self._read(item, "Subproject", False))
+                            for item in subtree
+                        ):
+                            raise MspError(
+                                ErrorCode.UNSUPPORTED_OPERATION,
+                                "Recursive deletion cannot cross external-task or subproject boundaries",
+                            )
             elif isinstance(operation, (UpdateResource, DeleteResource)):
                 check(operation.resource)
                 if isinstance(operation, UpdateResource):
+                    if operation.base_calendar is not None:
+                        check(operation.base_calendar)
                     if operation.resource.client_ref is not None:
                         resource_type = created_resource_types[operation.resource.client_ref]
                     else:
@@ -939,6 +1022,11 @@ class LiveProjectBackend:
                         raise MspError(
                             ErrorCode.INVALID_REQUEST,
                             "material_label is only valid for material resources",
+                        )
+                    if resource_type != ResourceType.WORK and operation.base_calendar is not None:
+                        raise MspError(
+                            ErrorCode.INVALID_REQUEST,
+                            "base_calendar is only valid for work resources",
                         )
             elif isinstance(operation, (UpdateAssignment, DeleteAssignment)):
                 check(operation.assignment)
@@ -993,6 +1081,9 @@ class LiveProjectBackend:
                     dependency_edges.add(edge)
                 else:
                     dependency_edges.discard(edge)
+            elif isinstance(operation, UpdateProjectProperties):
+                if operation.calendar is not None:
+                    check(operation.calendar)
 
         graph: dict[str, set[str]] = {}
         for left, right in dependency_edges:
@@ -1066,8 +1157,12 @@ class LiveProjectBackend:
             else 1
         )
         current_level = int(self._number(self._read(task, "OutlineLevel", 1), 1))
-        if current_level > target_level:
-            raise _RereadMismatch("New task was inserted below the requested outline level")
+        while current_level > target_level:
+            self._invoke(task.OutlineOutdent)
+            next_level = int(self._number(self._read(task, "OutlineLevel", 1), 1))
+            if next_level >= current_level:
+                raise _RereadMismatch("Task.OutlineOutdent did not reduce the outline level")
+            current_level = next_level
         while current_level < target_level:
             # Task.OutlineIndent is object-scoped and does not use selection/active cells.
             self._invoke(task.OutlineIndent)
@@ -1086,6 +1181,65 @@ class LiveProjectBackend:
             after_unique_id=int(after.UniqueID) if after is not None else None,
         )
 
+    def _apply_task_planning_fields(
+        self,
+        project: Any,
+        task: Any,
+        operation: CreateTask | UpdateTask,
+        local: dict[tuple[ObjectKind, str], Any],
+    ) -> None:
+        if operation.task_type is not None:
+            task.Type = _TASK_TYPE_TO_NATIVE[operation.task_type.value]
+        for public_name, native_name in (
+            ("effort_driven", "EffortDriven"),
+            ("manual", "Manual"),
+            ("priority", "Priority"),
+            ("notes", "Notes"),
+        ):
+            value = getattr(operation, public_name)
+            if value is not None:
+                setattr(task, native_name, value)
+        if operation.calendar is not None:
+            calendar = self._resolve_native(project, operation.calendar, local)
+            task.Calendar = self._text(calendar.Name)
+        elif isinstance(operation, UpdateTask) and operation.clear_calendar:
+            # An empty string selects Project's localized "None" calendar.
+            task.Calendar = ""
+        if operation.ignore_resource_calendar is not None:
+            task.IgnoreResourceCalendar = operation.ignore_resource_calendar
+        if operation.constraint_type is not None:
+            task.ConstraintType = _TASK_CONSTRAINT_TO_NATIVE[operation.constraint_type.value]
+        if operation.constraint_date is not None:
+            task.ConstraintDate = operation.constraint_date
+        if operation.deadline is not None:
+            task.Deadline = operation.deadline
+        elif isinstance(operation, UpdateTask) and operation.clear_deadline:
+            # Empty text clears the value without relying on localized NA/NV text.
+            task.Deadline = ""
+
+    def _apply_resource_details(
+        self,
+        project: Any,
+        resource: Any,
+        operation: CreateResource | UpdateResource,
+        local: dict[tuple[ObjectKind, str], Any],
+    ) -> None:
+        if operation.cost_accrual is not None:
+            resource.AccrueAt = _COST_ACCRUAL_TO_NATIVE[operation.cost_accrual.value]
+        for public_name, native_name in (
+            ("initials", "Initials"),
+            ("group", "Group"),
+            ("code", "Code"),
+            ("email", "EMailAddress"),
+            ("notes", "Notes"),
+        ):
+            value = getattr(operation, public_name)
+            if value is not None:
+                setattr(resource, native_name, value)
+        if operation.base_calendar is not None:
+            calendar = self._resolve_native(project, operation.base_calendar, local)
+            resource.BaseCalendar = self._text(calendar.Name)
+
     def _apply_one_on_sta(
         self,
         session: _LiveSession,
@@ -1100,6 +1254,7 @@ class LiveProjectBackend:
             task.Milestone = operation.milestone
             task.FixedCost = float(operation.fixed_cost)
             task.FixedCostAccrual = _COST_ACCRUAL_TO_NATIVE[operation.cost_accrual.value]
+            self._apply_task_planning_fields(project, task, operation, local)
             local[(ObjectKind.TASK, operation.client_ref)] = task
             return placement
         if isinstance(operation, UpdateTask):
@@ -1112,12 +1267,23 @@ class LiveProjectBackend:
                 task.FixedCost = float(operation.fixed_cost)
             if operation.cost_accrual is not None:
                 task.FixedCostAccrual = _COST_ACCRUAL_TO_NATIVE[operation.cost_accrual.value]
+            self._apply_task_planning_fields(project, task, operation, local)
             return task
         if isinstance(operation, DeleteTask):
             task = self._resolve_native(project, operation.task, local)
             uid = int(task.UniqueID)
+            deleted_uids = [uid]
+            if operation.recursive:
+                tasks = self._iter(self._read(project, "Tasks", ()))
+                index = next(index for index, item in enumerate(tasks) if int(item.UniqueID) == uid)
+                level = int(self._number(self._read(task, "OutlineLevel", 1), 1))
+                for child in tasks[index + 1 :]:
+                    child_level = int(self._number(self._read(child, "OutlineLevel", 1), 1))
+                    if child_level <= level:
+                        break
+                    deleted_uids.append(int(child.UniqueID))
             self._invoke(task.Delete)
-            return (ObjectKind.TASK, uid)
+            return (ObjectKind.TASK, tuple(deleted_uids))
         if isinstance(operation, CreateResource):
             resource = self._invoke(lambda: project.Resources.Add(operation.name))
             resource.Type = _RESOURCE_TYPE_TO_NATIVE[operation.resource_type.value]
@@ -1131,6 +1297,7 @@ class LiveProjectBackend:
                 resource.CostPerUse = float(operation.cost_per_use)
                 if operation.material_label is not None:
                     resource.MaterialLabel = operation.material_label
+            self._apply_resource_details(project, resource, operation, local)
             local[(ObjectKind.RESOURCE, operation.client_ref)] = resource
             return resource
         if isinstance(operation, UpdateResource):
@@ -1151,6 +1318,7 @@ class LiveProjectBackend:
             for field, value in rate_fields:
                 if value is not None:
                     setattr(resource, field, float(value) if isinstance(value, Decimal) else value)
+            self._apply_resource_details(project, resource, operation, local)
             return resource
         if isinstance(operation, DeleteResource):
             resource = self._resolve_native(project, operation.resource, local)
@@ -1254,26 +1422,88 @@ class LiveProjectBackend:
             return (ObjectKind.CALENDAR, guid)
         if isinstance(operation, UpdateProjectProperties):
             self._activate_session(session)
+            calendar_name = None
+            schedule_from = operation.schedule_from
+            if schedule_from is None and operation.project_start is not None:
+                schedule_from = ScheduleFrom.START
+            elif schedule_from is None and operation.project_finish is not None:
+                schedule_from = ScheduleFrom.FINISH
+            if operation.calendar is not None:
+                calendar = self._resolve_native(project, operation.calendar, local)
+                calendar_name = self._text(calendar.Name)
             values = {
                 key: value
                 for key, value in {
                     "Title": operation.title,
                     "Subject": operation.subject,
+                    "Author": operation.author,
                     "Company": operation.company,
                     "Manager": operation.manager,
+                    "Keywords": operation.keywords,
                     "Comments": operation.comments,
                     "Start": operation.project_start,
+                    "Finish": operation.project_finish,
+                    "ScheduleFrom": (
+                        _SCHEDULE_TO_NATIVE[schedule_from.value]
+                        if schedule_from is not None
+                        else None
+                    ),
+                    "CurrentDate": operation.current_date,
+                    "Calendar": calendar_name,
+                    "Priority": operation.priority,
                 }.items()
                 if value is not None
             }
-            project_name = self._text(self._read(project, "FullName", "")) or self._text(project.Name)
-            keys = ("Title", "Subject", "Author", "Company", "Manager", "Keywords", "Comments", "Start")
-            last = max(index for index, key in enumerate(keys) if key in values)
-            missing = importlib.import_module("pythoncom").Missing
-            args = (project_name,) + tuple(values.get(key, missing) for key in keys[: last + 1])
-            self._invoke(lambda: session.app.ProjectSummaryInfo(*args))
+            if values:
+                project_name = self._text(self._read(project, "FullName", "")) or self._text(project.Name)
+                keys = (
+                    "Title", "Subject", "Author", "Company", "Manager", "Keywords", "Comments",
+                    "Start", "Finish", "ScheduleFrom", "CurrentDate", "Calendar", "StatusDate", "Priority",
+                )
+                current = {
+                    "Title": self._text(self._read(project, "Title", "")),
+                    "Subject": self._text(self._read(project, "Subject", "")),
+                    "Author": self._text(self._read(project, "Author", "")),
+                    "Company": self._text(self._read(project, "Company", "")),
+                    "Manager": self._text(self._read(project, "Manager", "")),
+                    "Keywords": self._text(self._read(project, "Keywords", "")),
+                    "Comments": self._text(self._read(project, "ProjectNotes", "")),
+                    "Start": self._read(project, "ProjectStart", None),
+                    "Finish": self._read(project, "ProjectFinish", None),
+                    "ScheduleFrom": 1 if bool(self._read(project, "ScheduleFromStart", True)) else 2,
+                    "CurrentDate": self._read(project, "CurrentDate", None),
+                    "Calendar": self._text(self._read(self._read(project, "Calendar", None), "Name", "")),
+                    "StatusDate": self._read(project, "StatusDate", "NA"),
+                    "Priority": int(
+                        self._number(
+                            self._read(self._read(project, "ProjectSummaryTask", None), "Priority", 500),
+                            500,
+                        )
+                    ),
+                }
+                current.update(values)
+                last = max(index for index, key in enumerate(keys) if key in values)
+                args = (project_name,) + tuple(current[key] for key in keys[: last + 1])
+                self._invoke(lambda: session.app.ProjectSummaryInfo(*args))
             if operation.comments is not None:
                 project.ProjectNotes = operation.comments
+            direct = {
+                "DefaultTaskType": (
+                    _TASK_TYPE_TO_NATIVE[operation.default_task_type.value]
+                    if operation.default_task_type is not None
+                    else None
+                ),
+                "DefaultEffortDriven": operation.default_effort_driven,
+                "NewTasksCreatedAsManual": operation.new_tasks_manual,
+                "HonorConstraints": operation.honor_constraints,
+                "MultipleCriticalPaths": operation.multiple_critical_paths,
+                "HoursPerDay": float(operation.hours_per_day) if operation.hours_per_day is not None else None,
+                "HoursPerWeek": float(operation.hours_per_week) if operation.hours_per_week is not None else None,
+                "DaysPerMonth": float(operation.days_per_month) if operation.days_per_month is not None else None,
+            }
+            for name, value in direct.items():
+                if value is not None:
+                    setattr(project, name, value)
             return project
         if isinstance(operation, SetBaseline):
             self._activate_session(session)
@@ -1348,19 +1578,31 @@ class LiveProjectBackend:
         project = session.project
         observed: dict[str, Any]
         if isinstance(operation, (DeleteTask, DeleteResource, DeleteAssignment, DeleteCalendar)):
-            kind, uid = native
-            try:
-                ref = ObjectRef(kind=kind, guid=uid) if kind == ObjectKind.CALENDAR else ObjectRef(kind=kind, unique_id=uid)
-                self._resolve_native(project, ref)
-            except MspError:
-                observed = {
-                    "deleted_ref": {
-                        "kind": kind.value,
-                        "guid" if kind == ObjectKind.CALENDAR else "unique_id": uid,
-                    }
-                }
-            else:
-                raise _RereadMismatch("Deleted object remains present")
+            kind, identity = native
+            identities = identity if isinstance(identity, tuple) else (identity,)
+            deleted_refs = []
+            for uid in identities:
+                try:
+                    ref = (
+                        ObjectRef(kind=kind, guid=uid)
+                        if kind == ObjectKind.CALENDAR
+                        else ObjectRef(kind=kind, unique_id=uid)
+                    )
+                    self._resolve_native(project, ref)
+                except MspError:
+                    deleted_refs.append(
+                        {
+                            "kind": kind.value,
+                            "guid" if kind == ObjectKind.CALENDAR else "unique_id": uid,
+                        }
+                    )
+                else:
+                    raise _RereadMismatch("Deleted object remains present")
+            observed = (
+                {"deleted_ref": deleted_refs[0]}
+                if len(deleted_refs) == 1
+                else {"deleted_refs": deleted_refs}
+            )
         elif isinstance(operation, (AddDependency, RemoveDependency)):
             pred = self._resolve_native(project, operation.predecessor, local)
             succ = self._resolve_native(project, operation.successor, local)
@@ -1382,17 +1624,46 @@ class LiveProjectBackend:
             observed = {"dependency_count": len(matches)}
         elif isinstance(operation, UpdateProjectProperties):
             observed = self._project_items(project)[0]
+            schedule_from = operation.schedule_from
+            if schedule_from is None and operation.project_start is not None:
+                schedule_from = ScheduleFrom.START
+            elif schedule_from is None and operation.project_finish is not None:
+                schedule_from = ScheduleFrom.FINISH
+            calendar_ref = None
+            if operation.calendar is not None:
+                calendar = self._resolve_native(project, operation.calendar, local)
+                calendar_ref = self._calendar_ref(calendar)
             expected = {
                 "title": operation.title,
                 "manager": operation.manager,
                 "company": operation.company,
                 "subject": operation.subject,
+                "author": operation.author,
+                "keywords": operation.keywords,
                 "comments": operation.comments,
                 "project_start": self._date_value(operation.project_start),
+                "project_finish": self._date_value(operation.project_finish),
+                "schedule_from": schedule_from.value if schedule_from is not None else None,
+                "current_date": self._date_value(operation.current_date),
+                "calendar_ref": calendar_ref,
+                "priority": operation.priority,
+                "default_task_type": (
+                    operation.default_task_type.value if operation.default_task_type is not None else None
+                ),
+                "default_effort_driven": operation.default_effort_driven,
+                "new_tasks_manual": operation.new_tasks_manual,
+                "honor_constraints": operation.honor_constraints,
+                "multiple_critical_paths": operation.multiple_critical_paths,
+                "hours_per_day": float(operation.hours_per_day) if operation.hours_per_day is not None else None,
+                "hours_per_week": float(operation.hours_per_week) if operation.hours_per_week is not None else None,
+                "days_per_month": float(operation.days_per_month) if operation.days_per_month is not None else None,
             }
             for key, value in expected.items():
                 if value is not None and observed[key] != value:
-                    raise _RereadMismatch(f"Project property {key} did not match")
+                    raise _RereadMismatch(
+                        f"Project property {key} did not match: expected {value!r}, "
+                        f"observed {observed[key]!r}"
+                    )
         elif isinstance(operation, (SetBaseline, ClearBaseline)):
             observed = next(item for item in self._baselines(project) if item["baseline"] == operation.baseline)
             expected_set = isinstance(operation, SetBaseline)
@@ -1419,16 +1690,49 @@ class LiveProjectBackend:
             )
             checks: dict[str, Any] = {}
             if isinstance(operation, (CreateTask, UpdateTask)):
+                calendar_ref = None
+                if operation.calendar is not None:
+                    calendar_ref = self._calendar_ref(
+                        self._resolve_native(project, operation.calendar, local)
+                    )
                 checks = {
                     "name": operation.name,
                     "duration_minutes": operation.duration_minutes,
                     "fixed_cost": float(operation.fixed_cost) if operation.fixed_cost is not None else None,
                     "cost_accrual": operation.cost_accrual.value if operation.cost_accrual is not None else None,
+                    "constraint_type_name": (
+                        operation.constraint_type.value if operation.constraint_type is not None else None
+                    ),
+                    "constraint_date": self._date_value(operation.constraint_date),
+                    "deadline": (
+                        None if isinstance(operation, UpdateTask) and operation.clear_deadline
+                        else self._date_value(operation.deadline)
+                    ),
+                    "task_type": operation.task_type.value if operation.task_type is not None else None,
+                    "effort_driven": operation.effort_driven,
+                    "manual": operation.manual,
+                    "priority": operation.priority,
+                    "notes": operation.notes,
+                    "calendar_ref": (
+                        None if isinstance(operation, UpdateTask) and operation.clear_calendar
+                        else calendar_ref
+                    ),
+                    "ignore_resource_calendar": operation.ignore_resource_calendar,
                 }
             elif isinstance(operation, (CreateResource, UpdateResource)):
                 checks = {
                     "name": operation.name,
+                    "cost_accrual": operation.cost_accrual.value if operation.cost_accrual is not None else None,
+                    "initials": operation.initials,
+                    "group": operation.group,
+                    "code": operation.code,
+                    "email": operation.email,
+                    "notes": operation.notes,
                 }
+                if operation.base_calendar is not None:
+                    checks["base_calendar_ref"] = self._calendar_ref(
+                        self._resolve_native(project, operation.base_calendar, local)
+                    )
                 resource_type = (
                     operation.resource_type
                     if isinstance(operation, CreateResource)
@@ -1485,9 +1789,20 @@ class LiveProjectBackend:
                     requested_exceptions = [item.model_dump(mode="json") for item in operation.exceptions]
                     if observed["exceptions"] != requested_exceptions:
                         raise _RereadMismatch("Calendar exceptions did not match")
+            explicit_none = {
+                "deadline"
+                if isinstance(operation, UpdateTask) and operation.clear_deadline
+                else "",
+                "calendar_ref"
+                if isinstance(operation, UpdateTask) and operation.clear_calendar
+                else "",
+            }
             for key, value in checks.items():
-                if value is not None and observed[key] != value:
-                    raise _RereadMismatch(f"{operation.op} field {key} did not match")
+                if (value is not None or key in explicit_none) and observed[key] != value:
+                    raise _RereadMismatch(
+                        f"{operation.op} field {key} did not match: expected {value!r}, "
+                        f"observed {observed[key]!r}"
+                    )
             if placement is not None:
                 reread = self._resolve_native(
                     project,
@@ -1742,6 +2057,12 @@ class LiveProjectBackend:
         if self._server_app is None:
             self._server_app = self._automation_factory().create_application()
             self._server_app.Visible = self._server_app_visible
+            # This Application instance is owned exclusively by the backend.
+            # Prevent scheduling conflicts from opening modal wizard/error
+            # messages that would otherwise wedge the STA worker.
+            self._server_app.DisplayAlerts = False
+            self._server_app.DisplayWizardErrors = False
+            self._server_app.DisplayWizardScheduling = False
         return self._server_app
 
     def _bind(self, app: Any, project: Any, ownership: Ownership) -> _LiveSession:
@@ -1877,6 +2198,17 @@ class LiveProjectBackend:
         return str(target.resolve())
 
     @staticmethod
+    def _validated_template_target(path: str) -> str:
+        target = Path(path)
+        if not target.is_absolute():
+            raise MspError(ErrorCode.INVALID_REQUEST, "Microsoft Project template paths must be absolute")
+        if target.suffix.lower() not in {".mpt", ".mpp"}:
+            raise MspError(ErrorCode.INVALID_REQUEST, "Project templates must be .mpt or .mpp files")
+        if not target.is_file():
+            raise MspError(ErrorCode.INVALID_REQUEST, "The Microsoft Project template does not exist")
+        return str(target.resolve())
+
+    @staticmethod
     def _touch_project(project: Any) -> None:
         getattr(project, "Name")
 
@@ -1943,9 +2275,17 @@ class LiveProjectBackend:
     def _date_value(value: Any) -> str | None:
         if value in (None, ""):
             return None
-        if isinstance(value, (date, datetime)):
+        if isinstance(value, datetime):
+            # Project schedule values are local and the public contract is
+            # timezone-naive. pywin32 can return UTC-aware values, so restore
+            # the Windows local wall-clock value before removing the offset.
+            if value.tzinfo is not None:
+                value = value.astimezone().replace(tzinfo=None)
             return value.isoformat()
-        return str(value)
+        if isinstance(value, date):
+            return value.isoformat()
+        text = str(value)
+        return None if text.strip().upper() in {"NA", "NV"} else text
 
     @staticmethod
     def _time_value(value: Any) -> str:
@@ -1964,6 +2304,27 @@ class LiveProjectBackend:
     def _calendar_collection(self, project: Any) -> Any:
         calendars = self._read(project, "BaseCalendars", None)
         return calendars if calendars is not None else self._read(project, "Calendars", ())
+
+    def _calendar_ref(self, calendar: Any) -> dict[str, Any] | None:
+        if calendar is None:
+            return None
+        guid = self._text(self._read(calendar, "GUID", self._read(calendar, "Guid", "")))
+        if not guid:
+            return None
+        return ObjectRef(kind=ObjectKind.CALENDAR, guid=guid).model_dump(mode="json")
+
+    def _resource_base_calendar_ref(self, project: Any, resource: Any) -> dict[str, Any] | None:
+        name = self._text(self._read(resource, "BaseCalendar", "")).strip()
+        if not name:
+            resource_calendar = self._read(resource, "Calendar", None)
+            base = self._read(resource_calendar, "BaseCalendar", None)
+            name = self._text(self._read(base, "Name", base)).strip()
+        if not name:
+            return None
+        for calendar in self._iter(self._calendar_collection(project)):
+            if self._text(self._read(calendar, "Name", "")) == name:
+                return self._calendar_ref(calendar)
+        return None
 
     def _normalized_full_name(self, project: Any) -> str:
         value = self._text(self._read(project, "FullName", "")).strip()
@@ -2011,16 +2372,34 @@ class LiveProjectBackend:
         return readers[entity](project)
 
     def _project_items(self, project: Any) -> list[dict[str, Any]]:
+        summary = self._read(project, "ProjectSummaryTask", None)
         return [
             {
                 "name": self._text(self._read(project, "Name", "")),
                 "full_name": self._text(self._read(project, "FullName", "")) or None,
                 "saved": bool(self._read(project, "Saved", False)),
                 "project_start": self._date_value(self._read(project, "ProjectStart", None)),
+                "project_finish": self._date_value(self._read(project, "ProjectFinish", None)),
+                "schedule_from": "start" if bool(self._read(project, "ScheduleFromStart", True)) else "finish",
+                "current_date": self._date_value(self._read(project, "CurrentDate", None)),
+                "calendar_ref": self._calendar_ref(self._read(project, "Calendar", None)),
+                "priority": int(self._number(self._read(summary, "Priority", 500), 500)) if summary is not None else 500,
+                "default_task_type": self._mapped_enum(
+                    self._read(project, "DefaultTaskType", 0), _TASK_TYPE_FROM_NATIVE
+                ),
+                "default_effort_driven": bool(self._read(project, "DefaultEffortDriven", False)),
+                "new_tasks_manual": bool(self._read(project, "NewTasksCreatedAsManual", False)),
+                "honor_constraints": bool(self._read(project, "HonorConstraints", True)),
+                "multiple_critical_paths": bool(self._read(project, "MultipleCriticalPaths", False)),
+                "hours_per_day": self._number(self._read(project, "HoursPerDay", 8)),
+                "hours_per_week": self._number(self._read(project, "HoursPerWeek", 40)),
+                "days_per_month": self._number(self._read(project, "DaysPerMonth", 20)),
                 "title": self._text(self._read(project, "Title", "")),
                 "manager": self._text(self._read(project, "Manager", "")),
                 "company": self._text(self._read(project, "Company", "")),
                 "subject": self._text(self._read(project, "Subject", "")),
+                "author": self._text(self._read(project, "Author", "")),
+                "keywords": self._text(self._read(project, "Keywords", "")),
                 "comments": self._text(self._read(project, "ProjectNotes", self._read(project, "Comments", ""))),
             }
         ]
@@ -2042,7 +2421,22 @@ class LiveProjectBackend:
                     "critical": bool(self._read(task, "Critical", False)),
                     "total_slack_minutes": int(self._number(self._read(task, "TotalSlack", 0))),
                     "constraint_type": self._number(self._read(task, "ConstraintType", 0)),
+                    "constraint_type_name": self._mapped_enum(
+                        self._read(task, "ConstraintType", 0), _TASK_CONSTRAINT_FROM_NATIVE
+                    ),
                     "constraint_date": self._date_value(self._read(task, "ConstraintDate", None)),
+                    "deadline": self._date_value(self._read(task, "Deadline", None)),
+                    "task_type": self._mapped_enum(self._read(task, "Type", 0), _TASK_TYPE_FROM_NATIVE),
+                    "effort_driven": bool(self._read(task, "EffortDriven", False)),
+                    "manual": bool(self._read(task, "Manual", False)),
+                    "priority": int(self._number(self._read(task, "Priority", 500), 500)),
+                    "notes": self._text(self._read(task, "Notes", "")),
+                    "calendar_ref": self._calendar_ref(self._read(task, "CalendarObject", None)),
+                    "ignore_resource_calendar": bool(
+                        self._read(task, "IgnoreResourceCalendar", False)
+                    ),
+                    "outline_level": int(self._number(self._read(task, "OutlineLevel", 1), 1)),
+                    "outline_number": self._text(self._read(task, "OutlineNumber", "")),
                     "parent_ref": (
                         ObjectRef(kind=ObjectKind.TASK, unique_id=int(parent_uid)).model_dump(mode="json")
                         if parent_uid
@@ -2119,6 +2513,16 @@ class LiveProjectBackend:
                     "overtime_rate_per_hour": self._rate_number(self._read(resource, "OvertimeRate", 0)) if work else None,
                     "cost_per_use": self._rate_number(self._read(resource, "CostPerUse", 0)) if rate_based else None,
                     "material_label": self._text(self._read(resource, "MaterialLabel", "")) or None if material else None,
+                    "cost_accrual": self._mapped_enum(
+                        self._read(resource, "AccrueAt", 3), _COST_ACCRUAL_FROM_NATIVE
+                    ),
+                    "initials": self._text(self._read(resource, "Initials", "")),
+                    "group": self._text(self._read(resource, "Group", "")),
+                    "code": self._text(self._read(resource, "Code", "")),
+                    "email": self._text(self._read(resource, "EMailAddress", "")),
+                    "notes": self._text(self._read(resource, "Notes", "")),
+                    "base_calendar_ref": self._resource_base_calendar_ref(project, resource)
+                    if work else None,
                     "overallocated": bool(self._read(resource, "Overallocated", False)),
                 }
             )
@@ -2259,20 +2663,28 @@ class LiveProjectBackend:
     def _allowed_fields(entity: QueryEntity) -> set[str]:
         fields = {
             QueryEntity.PROJECT: {
-                "name", "full_name", "saved", "project_start", "title", "manager", "company", "subject", "comments"
+                "name", "full_name", "saved", "project_start", "project_finish", "schedule_from",
+                "current_date", "calendar_ref", "priority", "default_task_type",
+                "default_effort_driven", "new_tasks_manual", "honor_constraints",
+                "multiple_critical_paths", "hours_per_day", "hours_per_week", "days_per_month",
+                "title", "manager", "company", "subject", "author", "keywords", "comments"
             },
             QueryEntity.TASK: {
                 "ref", "name", "duration_minutes", "milestone", "parent_ref", "percent_complete",
                 "actual_duration_minutes", "remaining_duration_minutes", "actual_work_minutes",
                 "remaining_work_minutes", "actual_start", "actual_finish", "fixed_cost", "cost_accrual",
-                "start", "finish", "critical", "total_slack_minutes", "constraint_type", "constraint_date",
+                "start", "finish", "critical", "total_slack_minutes", "constraint_type",
+                "constraint_type_name", "constraint_date", "deadline", "task_type", "effort_driven",
+                "manual", "priority", "notes", "calendar_ref", "ignore_resource_calendar",
+                "outline_level", "outline_number",
                 "cost", "baseline_cost", "cost_variance", "finish_variance_minutes", "bcws", "bcwp",
                 "acwp", "schedule_variance"
             },
             QueryEntity.DEPENDENCY: {"predecessor", "successor", "dependency_type", "lag_minutes"},
             QueryEntity.RESOURCE: {
                 "ref", "name", "resource_type", "max_units_percent", "standard_rate", "standard_rate_basis",
-                "overtime_rate_per_hour", "cost_per_use", "material_label", "overallocated"
+                "overtime_rate_per_hour", "cost_per_use", "material_label", "cost_accrual",
+                "initials", "group", "code", "email", "notes", "base_calendar_ref", "overallocated"
             },
             QueryEntity.ASSIGNMENT: {
                 "ref", "task_ref", "resource_ref", "units_percent", "material_units", "work_minutes",

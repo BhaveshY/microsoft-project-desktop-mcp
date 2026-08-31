@@ -41,7 +41,7 @@ A good caller workflow is:
 | Tool | Purpose | Safety boundary |
 |---|---|---|
 | `msp_capabilities` | Report installation, backend, operations, and verification status | Read-only; never activates Project |
-| `msp_project` | Create, open, attach, save, detach, or close | Explicit ownership and dirty-file disposition |
+| `msp_project` | Create, create from a local `.mpt` or `.mpp` template, open, attach, save, detach, or close | Explicit ownership and dirty-file disposition |
 | `msp_query` | Read projects, tasks, dependencies, resources, assignments, calendars, baselines, or status | Stable refs, bounded pages, signed snapshot cursors |
 | `msp_apply` | Create/update/delete typed project objects in batches | Expected-state check, idempotency, plan/confirm, native reread |
 | `msp_schedule` | Calculate, level, clear leveling, or reschedule incomplete work | Allowlisted native Project commands |
@@ -135,27 +135,37 @@ The live path supports:
 
 - deterministic task creation at root or under a parent, with sibling placement
   after the referenced task's complete subtree;
-- task duration, milestone, fixed cost, and accrual updates;
+- task duration, milestone, fixed cost, accrual, constraint, deadline, task type,
+  effort-driven, manual scheduling, priority, notes, task calendar, and
+  resource-calendar behavior;
 - FS, SS, FF, and SF dependencies with lag in minutes;
 - work and material resource rates, per-use costs, and labels; `standard_rate`
   is per hour for work resources and per material unit for material resources;
   cost resources use explicit assignment `cost` values; work assignments use
   `units_percent`, while material assignments use `material_units`;
+- resource accrual, initials, group, code, email, notes, and work-resource base
+  calendars;
 - base calendars, weekly work intervals, and calendar exceptions;
-- project summary properties, baselines 0 through 10, calculation, leveling,
-  leveling clear, and rescheduling incomplete work;
+- project metadata, schedule direction and dates, project calendar, priority,
+  task defaults, constraint behavior, multiple critical paths, and calendar
+  unit defaults;
+- confirmed recursive summary-task deletion within one standalone project;
+- project creation from a local `.mpt` or `.mpp` template;
+- baselines 0 through 10, calculation, leveling, leveling clear, and
+  rescheduling incomplete work;
 - status date, task progress/actuals, and per-day assignment Actual Work;
 - native critical/slack/constraint/overallocation/variance/earned-value reads;
 - PDF export and safe copies of saved, clean MPP files.
 
 Existing task row reordering (`move_task`) is rejected. Microsoft documents
 object-scoped task indentation, but not an equivalent object-scoped row move;
-the usual move/indent UI commands depend on selection. Recursive task deletion
-is also rejected, and a non-recursive delete refuses summary tasks because
-Project would cascade that deletion to their subtasks. Recreate or restructure
-such sections in a reviewed batch. Live variance and earned-value analysis is
-currently limited to the primary baseline (`baseline=0`); other baseline
-numbers are rejected rather than mislabeled.
+the usual move commands depend on selection. Native recurring-task insertion
+opens a dialog, so recurring tasks must be expanded into normal typed tasks.
+Subprojects, cross-project links, linked resource pools, generic custom-field
+mutation, and report authoring remain outside the standalone object-scoped
+contract. Recursive deletion refuses external-task or subproject boundaries.
+Live variance and earned-value analysis is limited to the primary baseline
+(`baseline=0`); other baseline numbers are rejected rather than mislabeled.
 
 ## Failure, replay, and recovery
 

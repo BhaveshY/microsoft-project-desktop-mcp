@@ -41,6 +41,8 @@ from ms_project_mcp.models import (
     CalendarException,
     ClearBaseline,
     TaskProgressUpdate,
+    TaskConstraintType,
+    TaskType,
     TimephasedWorkUpdate,
     UpdateCalendar,
     UpdateProjectProperties,
@@ -101,6 +103,16 @@ class _FakeTask(_ThreadChecked):
         self.TotalSlack = 0
         self.ConstraintType = 0
         self.ConstraintDate = None
+        self.Deadline = None
+        self.Type = 0
+        self.EffortDriven = False
+        self.Manual = False
+        self.Priority = 500
+        self.Notes = ""
+        self.Calendar = "None"
+        self.CalendarObject = None
+        self.IgnoreResourceCalendar = False
+        self.OutlineNumber = ""
         self.Cost = 100
         self.BaselineCost = 80
         self.CostVariance = 20
@@ -111,6 +123,15 @@ class _FakeTask(_ThreadChecked):
         self.SV = -5
         self.BaselineStart = datetime(2027, 1, 1, 8, 0)
         self.TaskDependencies = []
+
+    def __setattr__(self, name, value):
+        super().__setattr__(name, value)
+        if name == "Calendar" and hasattr(self, "_project"):
+            calendar = next(
+                (item for item in self._project.BaseCalendars if item.Name == value),
+                None,
+            )
+            super().__setattr__("CalendarObject", calendar)
 
     def Delete(self) -> None:
         descendants = [
@@ -146,6 +167,16 @@ class _FakeTask(_ThreadChecked):
         self.OutlineParent = parent
         self.OutlineLevel += 1
         self._factory.outline_indent_calls.append(self.UniqueID)
+        self._project.Saved = False
+
+    def OutlineOutdent(self) -> None:
+        if self.OutlineLevel <= 1:
+            return
+        self.OutlineParent = (
+            self.OutlineParent.OutlineParent if self.OutlineParent is not None else None
+        )
+        self.OutlineLevel -= 1
+        self._factory.outline_outdent_calls.append(self.UniqueID)
         self._project.Saved = False
 
 
@@ -239,6 +270,14 @@ class _FakeResource(_ThreadChecked):
         self.OvertimeRate = 180
         self.CostPerUse = 10
         self.MaterialLabel = ""
+        self.AccrueAt = 3
+        self.Initials = ""
+        self.Group = ""
+        self.Code = ""
+        self.EMailAddress = ""
+        self.Notes = ""
+        self.BaseCalendar = "Standard"
+        self.Calendar = None
         self.Overallocated = False
 
     def __setattr__(self, name, value):
@@ -250,6 +289,12 @@ class _FakeResource(_ThreadChecked):
         if resource_type == 2 and name in {"MaxUnits", "StandardRate", "CostPerUse"}:
             raise RuntimeError("Project error 1101: rate fields are invalid for cost resources")
         super().__setattr__(name, value)
+        if name == "BaseCalendar" and hasattr(self, "_project"):
+            calendar = next(
+                (item for item in self._project.BaseCalendars if item.Name == value),
+                None,
+            )
+            super().__setattr__("Calendar", calendar)
 
     def Delete(self) -> None:
         self._project.Resources.remove(self)
@@ -439,7 +484,8 @@ class _FakeProjects(_ThreadChecked):
         self._kind = kind
         self._items = []
 
-    def Add(self):
+    def Add(self, *args):
+        self._factory.project_add_calls.append(args)
         project = _FakeProject(self._factory, self._kind, name="Project", full_name="")
         object.__setattr__(project, "_app", self._app)
         self._items.append(project)
@@ -461,10 +507,23 @@ class _FakeProject(_ThreadChecked):
         self.ProjectGUID = f"native-{kind}-guid-{factory.project_count}"
         self.UniqueID = 999
         self.ProjectStart = datetime(2027, 1, 1, 8, 0)
+        self.ProjectFinish = datetime(2027, 1, 31, 17, 0)
+        self.ScheduleFromStart = True
+        self.CurrentDate = datetime(2027, 1, 1, 8, 0)
+        self.DefaultTaskType = 0
+        self.DefaultEffortDriven = False
+        self.NewTasksCreatedAsManual = False
+        self.HonorConstraints = True
+        self.MultipleCriticalPaths = False
+        self.HoursPerDay = 8
+        self.HoursPerWeek = 40
+        self.DaysPerMonth = 20
         self.Title = "Program"
         self.Manager = "Ada"
         self.Company = "Example"
         self.Subject = "Delivery"
+        self.Author = ""
+        self.Keywords = ""
         self.ProjectNotes = ""
         self.StatusDate = datetime(2027, 1, 2, 17, 0)
         root = _FakeTask(factory, 11, "Root")
@@ -472,6 +531,7 @@ class _FakeProject(_ThreadChecked):
         resource = _FakeResource(factory)
         self.Tasks = _FakeTasks(factory, self)
         self.Tasks._items.extend((root, child))
+        self.ProjectSummaryTask = root
         self.Tasks._reindex()
         for task in (root, child):
             object.__setattr__(task, "_project", self)
@@ -487,6 +547,7 @@ class _FakeProject(_ThreadChecked):
         self.Assignments._items.append(assignment)
         self.Calendars = [_FakeCalendar(factory)]
         self.BaseCalendars = self.Calendars
+        self.Calendar = self.Calendars[0]
         dependency = _FakeDependency(factory, root, child)
         object.__setattr__(dependency, "_project", self)
         self.Dependencies = [dependency]
@@ -535,16 +596,25 @@ class _FakeProject(_ThreadChecked):
         task_fields = (
             "Name", "Duration", "Milestone", "PercentComplete", "ActualDuration", "RemainingDuration",
             "ActualWork", "RemainingWork", "ActualStart", "ActualFinish", "FixedCost", "FixedCostAccrual",
+            "ConstraintType", "ConstraintDate", "Deadline", "Type", "EffortDriven", "Manual",
+            "Priority", "Notes", "Calendar", "CalendarObject", "IgnoreResourceCalendar",
         )
         resource_fields = (
             "Name", "Type", "MaxUnits", "StandardRate", "OvertimeRate", "CostPerUse", "MaterialLabel",
+            "AccrueAt", "Initials", "Group", "Code", "EMailAddress", "Notes", "BaseCalendar", "Calendar",
         )
         assignment_fields = ("Units", "Work", "ActualWork", "CostRateTable", "Cost")
         return {
             "saved": self.Saved,
             "project": {
                 key: copy.deepcopy(getattr(self, key))
-                for key in ("Title", "Manager", "Company", "Subject", "ProjectNotes", "ProjectStart", "StatusDate", "Baselines")
+                for key in (
+                    "Title", "Manager", "Company", "Subject", "Author", "Keywords", "ProjectNotes",
+                    "ProjectStart", "ProjectFinish", "ScheduleFromStart", "CurrentDate", "Calendar",
+                    "DefaultTaskType", "DefaultEffortDriven", "NewTasksCreatedAsManual",
+                    "HonorConstraints", "MultipleCriticalPaths", "HoursPerDay", "HoursPerWeek",
+                    "DaysPerMonth", "StatusDate", "Baselines",
+                )
                 if key in self.__dict__
             },
             "tasks": list(self.Tasks._items),
@@ -687,22 +757,28 @@ class _FakeApplication(_ThreadChecked):
         if kwargs:
             raise AssertionError("ProjectSummaryInfo must use positional arguments")
         self._factory.project_summary_calls.append(args)
-        if args:
-            import pythoncom
-
-            keys = ("Project", "Title", "Subject", "Author", "Company", "Manager", "Keywords", "Comments", "Start")
-            kwargs.update(
-                (key, value)
-                for key, value in zip(keys, args)
-                if key != "Project" and value is not pythoncom.Missing
-            )
+        keys = (
+            "Project", "Title", "Subject", "Author", "Company", "Manager", "Keywords",
+            "Comments", "Start", "Finish", "ScheduleFrom", "CurrentDate", "Calendar",
+            "StatusDate", "Priority",
+        )
+        kwargs.update((key, value) for key, value in zip(keys, args) if key != "Project")
         mapping = {
-            "Title": "Title", "Subject": "Subject", "Company": "Company", "Manager": "Manager",
-            "Comments": "ProjectNotes", "Start": "ProjectStart",
+            "Title": "Title", "Subject": "Subject", "Author": "Author", "Company": "Company",
+            "Manager": "Manager", "Keywords": "Keywords", "Comments": "ProjectNotes",
+            "Start": "ProjectStart", "Finish": "ProjectFinish", "CurrentDate": "CurrentDate",
         }
         for key, target in mapping.items():
             if key in kwargs:
                 setattr(self.ActiveProject, target, kwargs[key])
+        if "ScheduleFrom" in kwargs:
+            self.ActiveProject.ScheduleFromStart = kwargs["ScheduleFrom"] == 1
+        if "Calendar" in kwargs:
+            self.ActiveProject.Calendar = next(
+                item for item in self.ActiveProject.BaseCalendars if item.Name == kwargs["Calendar"]
+            )
+        if "Priority" in kwargs:
+            self.ActiveProject.ProjectSummaryTask.Priority = kwargs["Priority"]
         self.ActiveProject.Saved = False
 
     def BaselineSave(self, all_tasks, copy_from, into):
@@ -817,6 +893,7 @@ class _FakeAutomationFactory:
         self.timescale_item_calls: list[int] = []
         self.task_add_calls: list[tuple[str, int | None]] = []
         self.outline_indent_calls: list[int] = []
+        self.outline_outdent_calls: list[int] = []
         self.last_created_task = None
         self.force_created_parent_mismatch = False
         self.force_created_root_parent_proxy = False
@@ -834,6 +911,7 @@ class _FakeAutomationFactory:
         self.assignment_units_as_percentage = False
         self.assignment_add_units: list[float | None] = []
         self.project_summary_calls: list[tuple] = []
+        self.project_add_calls: list[tuple] = []
         self.omit_explicit_baselines = False
         self.modal_prompt_attempted = False
         self.save_as_result = True
@@ -921,6 +999,8 @@ class LiveProjectBackendTests(unittest.TestCase):
         self.assertTrue(capabilities.available)
         self.assertFalse(capabilities.activates_desktop)
         self.assertIn("create_task:parent_after", capabilities.supported_operations)
+        self.assertIn("delete_task:non_recursive", capabilities.supported_operations)
+        self.assertIn("delete_task:recursive", capabilities.supported_operations)
         self.assertIn("status:timephased_actual_work_daily", capabilities.supported_operations)
         self.assertNotIn("move_task", capabilities.supported_operations)
         self.assertEqual(host.state, StaHostState.NEW)
@@ -980,6 +1060,23 @@ class LiveProjectBackendTests(unittest.TestCase):
         self.assertEqual(factory.provider_calls, 0)
         backend.shutdown()
 
+    def test_create_from_template_uses_the_documented_projects_add_arguments(self) -> None:
+        backend, factory, _ = self._backend()
+        with tempfile.TemporaryDirectory() as directory:
+            template = os.path.join(directory, "delivery.mpt")
+            with open(template, "wb") as stream:
+                stream.write(b"fake-template")
+            session = backend.create_project(
+                name="From template",
+                path=None,
+                template_path=template,
+            )
+            self.assertEqual(
+                factory.project_add_calls[-1],
+                (False, os.path.realpath(template), False),
+            )
+            self._discard_and_shutdown(backend, session.project)
+
     def test_live_read_boundary_is_stable_and_detects_ui_state_changes(self) -> None:
         backend, factory, host = self._backend()
         session = backend.create_project(name="Launch", path=None)
@@ -1027,7 +1124,76 @@ class LiveProjectBackendTests(unittest.TestCase):
     def test_project_summary_info_uses_positional_calls(self) -> None:
         backend, factory, _ = self._backend()
         session = backend.create_project(name="Positional title", path=None)
-        self.assertEqual(factory.project_summary_calls, [("Project", "Positional title")])
+        self.assertEqual(
+            factory.project_summary_calls,
+            [("Project", "Positional title")],
+        )
+        self._discard_and_shutdown(backend, session.project)
+
+    def test_advanced_planning_fields_use_object_scoped_com_and_reread(self) -> None:
+        backend, _, _ = self._backend()
+        session = backend.create_project(name="Advanced planning", path=None)
+        start = datetime(2027, 2, 1, 8, 0)
+        deadline = datetime(2027, 2, 12, 17, 0)
+        receipt = backend.apply_operations(
+            session.project,
+            (
+                CreateCalendar(client_ref="delivery-calendar", name="Delivery Calendar"),
+                CreateTask(
+                    client_ref="controlled-task",
+                    name="Controlled task",
+                    constraint_type=TaskConstraintType.START_NO_EARLIER_THAN,
+                    constraint_date=start,
+                    deadline=deadline,
+                    task_type=TaskType.FIXED_DURATION,
+                    effort_driven=False,
+                    manual=False,
+                    priority=700,
+                    notes="Release gate",
+                    calendar=ObjectRef(kind=ObjectKind.CALENDAR, client_ref="delivery-calendar"),
+                    ignore_resource_calendar=True,
+                ),
+                CreateResource(
+                    client_ref="lead",
+                    name="Delivery Lead",
+                    initials="DL",
+                    group="Delivery",
+                    code="DL-01",
+                    email="lead@example.com",
+                    notes="Primary owner",
+                    base_calendar=ObjectRef(kind=ObjectKind.CALENDAR, client_ref="delivery-calendar"),
+                ),
+                UpdateProjectProperties(
+                    calendar=ObjectRef(kind=ObjectKind.CALENDAR, client_ref="delivery-calendar"),
+                    default_task_type=TaskType.FIXED_DURATION,
+                    default_effort_driven=False,
+                    new_tasks_manual=False,
+                    honor_constraints=True,
+                    multiple_critical_paths=True,
+                ),
+            ),
+            idempotency_key="advanced-planning-0001",
+            verification=VerificationLevel.NATIVE_REREAD,
+            expected_state=session.state,
+        )
+        self.assertTrue(all(item["verified"] for item in receipt.observed))
+        task = next(
+            item
+            for item in backend.query(
+                session.project, QueryEntity.TASK, fields=(), limit=100, offset=0
+            ).items
+            if item["name"] == "Controlled task"
+        )
+        resource = next(
+            item
+            for item in backend.query(
+                session.project, QueryEntity.RESOURCE, fields=(), limit=100, offset=0
+            ).items
+            if item["name"] == "Delivery Lead"
+        )
+        self.assertEqual(task["constraint_type_name"], TaskConstraintType.START_NO_EARLIER_THAN.value)
+        self.assertEqual(task["calendar_ref"]["guid"], "calendar-guid-2")
+        self.assertEqual(resource["base_calendar_ref"]["guid"], "calendar-guid-2")
         self._discard_and_shutdown(backend, session.project)
 
     def test_assignments_use_task_collections(self) -> None:
@@ -1114,6 +1280,24 @@ class LiveProjectBackendTests(unittest.TestCase):
             lambda: [item.UniqueID for item in factory.server_app.ActiveProject.Tasks]
         )
         self.assertEqual(remaining, [11, 22])
+        self._discard_and_shutdown(backend, session.project)
+
+    def test_recursive_delete_removes_and_verifies_the_summary_subtree(self) -> None:
+        backend, _, _ = self._backend()
+        session = backend.create_project(name="Recursive delete", path=None)
+        receipt = backend.apply_operations(
+            session.project,
+            (DeleteTask(task=ObjectRef(kind=ObjectKind.TASK, unique_id=11), recursive=True),),
+            idempotency_key="recursive-delete-0001",
+            verification=VerificationLevel.NATIVE_REREAD,
+            expected_state=session.state,
+        )
+        deleted = receipt.observed[0]["native"]["deleted_refs"]
+        self.assertEqual([item["unique_id"] for item in deleted], [11, 22])
+        tasks = backend.query(
+            session.project, QueryEntity.TASK, fields=(), limit=100, offset=0
+        )
+        self.assertEqual(tasks.items, ())
         self._discard_and_shutdown(backend, session.project)
 
     def test_live_apply_full_supported_batch_calculates_once_and_rereads(self) -> None:

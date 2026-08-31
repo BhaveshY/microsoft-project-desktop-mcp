@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import unittest
+from datetime import datetime
+from decimal import Decimal
 
 from pydantic import ValidationError
 
@@ -15,6 +17,8 @@ from ms_project_mcp.models import (
     ChangeReceipt,
     CloseDisposition,
     ContractFidelity,
+    CreateCalendar,
+    CreateResource,
     CreateTask,
     DeleteTask,
     DesktopSmoke,
@@ -25,6 +29,10 @@ from ms_project_mcp.models import (
     ProjectRequest,
     QueryEntity,
     QueryRequest,
+    ResourceType,
+    TaskConstraintType,
+    TaskType,
+    UpdateProjectProperties,
 )
 from ms_project_mcp.server import mcp
 from ms_project_mcp.service import ProjectService
@@ -164,6 +172,90 @@ class MicrosoftProjectMcpContractTests(unittest.TestCase):
         self.assertEqual([item["ref"]["unique_id"] for item in first.items], [1, 2])
         with self.assertRaises(ValidationError):
             ObjectRef(kind=ObjectKind.TASK, unique_id=1, client_ref="also-set")
+
+    def test_advanced_standalone_planning_fields_round_trip(self) -> None:
+        with self.assertRaises(ValidationError):
+            CreateTask(
+                client_ref="invalid",
+                name="Invalid",
+                constraint_type=TaskConstraintType.START_NO_EARLIER_THAN,
+            )
+
+        session = self._create()
+        start = datetime(2027, 2, 1, 8, 0)
+        deadline = datetime(2027, 2, 12, 17, 0)
+        operations = (
+            CreateCalendar(client_ref="delivery-calendar", name="Delivery Calendar"),
+            CreateTask(
+                client_ref="controlled-task",
+                name="Controlled task",
+                duration_minutes=2400,
+                constraint_type=TaskConstraintType.START_NO_EARLIER_THAN,
+                constraint_date=start,
+                deadline=deadline,
+                task_type=TaskType.FIXED_DURATION,
+                effort_driven=False,
+                manual=False,
+                priority=700,
+                notes="Release gate",
+                calendar=ObjectRef(kind=ObjectKind.CALENDAR, client_ref="delivery-calendar"),
+                ignore_resource_calendar=True,
+            ),
+            CreateResource(
+                client_ref="lead",
+                name="Delivery Lead",
+                resource_type=ResourceType.WORK,
+                standard_rate=Decimal("150"),
+                initials="DL",
+                group="Delivery",
+                code="DL-01",
+                email="lead@example.com",
+                notes="Primary owner",
+                base_calendar=ObjectRef(kind=ObjectKind.CALENDAR, client_ref="delivery-calendar"),
+            ),
+            UpdateProjectProperties(
+                calendar=ObjectRef(kind=ObjectKind.CALENDAR, client_ref="delivery-calendar"),
+                default_task_type=TaskType.FIXED_DURATION,
+                default_effort_driven=False,
+                new_tasks_manual=False,
+                honor_constraints=True,
+                multiple_critical_paths=True,
+                hours_per_day=Decimal("8"),
+                hours_per_week=Decimal("40"),
+            ),
+        )
+        receipt = self.service.apply(
+            ApplyRequest(
+                project=session.project,
+                batch=OperationBatch(
+                    operations=operations,
+                    expected_state=session.state,
+                    idempotency_key="advanced-roundtrip-0001",
+                    mode=BatchMode.COMMIT,
+                ),
+            )
+        )
+        task = self.service.query(
+            QueryRequest(project=session.project, entity=QueryEntity.TASK)
+        ).items[0]
+        resource = self.service.query(
+            QueryRequest(project=session.project, entity=QueryEntity.RESOURCE)
+        ).items[0]
+        project = self.service.query(
+            QueryRequest(project=session.project, entity=QueryEntity.PROJECT)
+        ).items[0]
+        self.assertEqual(task["constraint_type"], 4)
+        self.assertEqual(
+            task["constraint_type_name"], TaskConstraintType.START_NO_EARLIER_THAN.value
+        )
+        self.assertEqual(task["deadline"], deadline.isoformat())
+        self.assertEqual(task["task_type"], TaskType.FIXED_DURATION.value)
+        self.assertEqual(task["calendar_ref"]["unique_id"], 1)
+        self.assertEqual(resource["base_calendar_ref"]["unique_id"], 1)
+        self.assertEqual(resource["email"], "lead@example.com")
+        self.assertEqual(project["calendar_ref"]["unique_id"], 1)
+        self.assertEqual(project["default_task_type"], TaskType.FIXED_DURATION.value)
+        self.assertEqual(receipt.state_after, self.backend.current_state(session.project))
 
     def test_stale_state_is_rejected_before_dispatch(self) -> None:
         session, _ = self._seed_two_tasks()

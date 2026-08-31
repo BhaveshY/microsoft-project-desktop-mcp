@@ -56,6 +56,7 @@ from .models import (
     StatusRequest,
     UpdateAssignment,
     UpdateCalendar,
+    UpdateProjectProperties,
     UpdateResource,
     UpdateTask,
 )
@@ -97,7 +98,13 @@ class ProjectService:
                 raise MspError(ErrorCode.INVALID_REQUEST, "create requires name")
             return self._lifecycle_open(
                 request,
-                lambda: self.backend.create_project(name=request.name, path=request.path),
+                (lambda: self.backend.create_project(
+                        name=request.name,
+                        path=request.path,
+                        template_path=request.template_path,
+                    ))
+                    if request.template_path is not None
+                    else (lambda: self.backend.create_project(name=request.name, path=request.path)),
             )
         if request.action == ProjectAction.OPEN:
             if request.path is None:
@@ -178,7 +185,12 @@ class ProjectService:
         fingerprint = self._fingerprint(
             family,
             request.idempotency_key,
-            {"action": request.action.value, "name": request.name, "path": request.path},
+            {
+                "action": request.action.value,
+                "name": request.name,
+                "path": request.path,
+                "template_path": request.template_path,
+            },
         )
         result = self._dispatch(
             scope,
@@ -632,12 +644,15 @@ class ProjectService:
             if isinstance(operation, CreateTask):
                 parent_ref = resolve(operation.parent)
                 resolve(operation.after)
+                resolve(operation.calendar)
                 available[ObjectKind.TASK].add(operation.client_ref)
                 task_ref = f"task:client:{operation.client_ref}"
                 if parent_ref is not None:
                     parent_edges.add((task_ref, parent_ref))
             elif isinstance(operation, (UpdateTask, DeleteTask)):
                 task_ref = resolve(operation.task)
+                if isinstance(operation, UpdateTask):
+                    resolve(operation.calendar)
                 if isinstance(operation, DeleteTask) and task_ref is not None:
                     deleted_tasks.add(task_ref)
             elif isinstance(operation, MoveTask):
@@ -651,9 +666,12 @@ class ProjectService:
                 if parent_ref is not None:
                     parent_edges.add((task_ref, parent_ref))
             elif isinstance(operation, CreateResource):
+                resolve(operation.base_calendar)
                 available[ObjectKind.RESOURCE].add(operation.client_ref)
             elif isinstance(operation, (UpdateResource, DeleteResource)):
                 resolve(operation.resource)
+                if isinstance(operation, UpdateResource):
+                    resolve(operation.base_calendar)
             elif isinstance(operation, CreateAssignment):
                 resolve(operation.task)
                 resolve(operation.resource)
@@ -674,6 +692,8 @@ class ProjectService:
                 resolve(operation.base_calendar)
                 available[ObjectKind.CALENDAR].add(operation.client_ref)
             elif isinstance(operation, (UpdateCalendar, DeleteCalendar)):
+                resolve(operation.calendar)
+            elif isinstance(operation, UpdateProjectProperties):
                 resolve(operation.calendar)
         edges = {edge for edge in edges if edge[0] not in deleted_tasks and edge[1] not in deleted_tasks}
         parent_edges = {

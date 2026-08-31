@@ -4,7 +4,7 @@ from datetime import date, datetime, time, timezone
 from decimal import Decimal
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
 from .compat import StrEnum
 
@@ -116,6 +116,28 @@ class CostAccrual(StrEnum):
     PRORATED = "prorated"
 
 
+class TaskType(StrEnum):
+    FIXED_UNITS = "fixed_units"
+    FIXED_DURATION = "fixed_duration"
+    FIXED_WORK = "fixed_work"
+
+
+class TaskConstraintType(StrEnum):
+    AS_SOON_AS_POSSIBLE = "as_soon_as_possible"
+    AS_LATE_AS_POSSIBLE = "as_late_as_possible"
+    MUST_START_ON = "must_start_on"
+    MUST_FINISH_ON = "must_finish_on"
+    START_NO_EARLIER_THAN = "start_no_earlier_than"
+    START_NO_LATER_THAN = "start_no_later_than"
+    FINISH_NO_EARLIER_THAN = "finish_no_earlier_than"
+    FINISH_NO_LATER_THAN = "finish_no_later_than"
+
+
+class ScheduleFrom(StrEnum):
+    START = "start"
+    FINISH = "finish"
+
+
 class Weekday(StrEnum):
     MONDAY = "monday"
     TUESDAY = "tuesday"
@@ -160,6 +182,24 @@ def _naive(value: datetime | None, field_name: str) -> datetime | None:
     return value
 
 
+def _validate_task_constraint(
+    constraint_type: TaskConstraintType | None,
+    constraint_date: datetime | None,
+) -> None:
+    dated = {
+        TaskConstraintType.MUST_START_ON,
+        TaskConstraintType.MUST_FINISH_ON,
+        TaskConstraintType.START_NO_EARLIER_THAN,
+        TaskConstraintType.START_NO_LATER_THAN,
+        TaskConstraintType.FINISH_NO_EARLIER_THAN,
+        TaskConstraintType.FINISH_NO_LATER_THAN,
+    }
+    if constraint_type in dated and constraint_date is None:
+        raise ValueError("dated task constraints require constraint_date")
+    if constraint_date is not None and constraint_type not in dated:
+        raise ValueError("constraint_date requires a dated constraint_type")
+
+
 class CreateTask(ContractModel):
     op: Literal["create_task"] = "create_task"
     client_ref: str = Field(min_length=1, max_length=128)
@@ -170,6 +210,21 @@ class CreateTask(ContractModel):
     after: ObjectRef | None = None
     fixed_cost: Decimal = Field(default=Decimal("0"), ge=0)
     cost_accrual: CostAccrual = CostAccrual.PRORATED
+    constraint_type: TaskConstraintType | None = None
+    constraint_date: datetime | None = None
+    deadline: datetime | None = None
+    task_type: TaskType | None = None
+    effort_driven: bool | None = None
+    manual: bool | None = None
+    priority: int | None = Field(default=None, ge=0, le=1000)
+    notes: str | None = Field(default=None, max_length=32000)
+    calendar: ObjectRef | None = None
+    ignore_resource_calendar: bool | None = None
+
+    @field_validator("constraint_date", "deadline")
+    @classmethod
+    def project_local_times(cls, value: datetime | None, info: Any) -> datetime | None:
+        return _naive(value, info.field_name)
 
     @model_validator(mode="after")
     def valid_task(self) -> CreateTask:
@@ -177,6 +232,8 @@ class CreateTask(ContractModel):
             raise ValueError("milestone tasks require duration_minutes=0")
         _require_kind(self.parent, ObjectKind.TASK, "parent")
         _require_kind(self.after, ObjectKind.TASK, "after")
+        _require_kind(self.calendar, ObjectKind.CALENDAR, "calendar")
+        _validate_task_constraint(self.constraint_type, self.constraint_date)
         return self
 
 
@@ -187,12 +244,50 @@ class UpdateTask(ContractModel):
     duration_minutes: int | None = Field(default=None, ge=0)
     fixed_cost: Decimal | None = Field(default=None, ge=0)
     cost_accrual: CostAccrual | None = None
+    constraint_type: TaskConstraintType | None = None
+    constraint_date: datetime | None = None
+    deadline: datetime | None = None
+    clear_deadline: bool = False
+    task_type: TaskType | None = None
+    effort_driven: bool | None = None
+    manual: bool | None = None
+    priority: int | None = Field(default=None, ge=0, le=1000)
+    notes: str | None = Field(default=None, max_length=32000)
+    calendar: ObjectRef | None = None
+    clear_calendar: bool = False
+    ignore_resource_calendar: bool | None = None
+
+    @field_validator("constraint_date", "deadline")
+    @classmethod
+    def project_local_times(cls, value: datetime | None, info: Any) -> datetime | None:
+        return _naive(value, info.field_name)
 
     @model_validator(mode="after")
     def valid_update(self) -> UpdateTask:
         _require_kind(self.task, ObjectKind.TASK, "task")
-        if all(value is None for value in (self.name, self.duration_minutes, self.fixed_cost, self.cost_accrual)):
+        _require_kind(self.calendar, ObjectKind.CALENDAR, "calendar")
+        _validate_task_constraint(self.constraint_type, self.constraint_date)
+        values = (
+            self.name,
+            self.duration_minutes,
+            self.fixed_cost,
+            self.cost_accrual,
+            self.constraint_type,
+            self.deadline,
+            self.task_type,
+            self.effort_driven,
+            self.manual,
+            self.priority,
+            self.notes,
+            self.calendar,
+            self.ignore_resource_calendar,
+        )
+        if all(value is None for value in values) and not self.clear_deadline and not self.clear_calendar:
             raise ValueError("update_task requires at least one changed planning field")
+        if self.deadline is not None and self.clear_deadline:
+            raise ValueError("deadline cannot be combined with clear_deadline")
+        if self.calendar is not None and self.clear_calendar:
+            raise ValueError("calendar cannot be combined with clear_calendar")
         return self
 
 
@@ -235,9 +330,17 @@ class CreateResource(ContractModel):
     overtime_rate_per_hour: Decimal = Field(default=Decimal("0"), ge=0)
     cost_per_use: Decimal = Field(default=Decimal("0"), ge=0)
     material_label: str | None = Field(default=None, max_length=64)
+    cost_accrual: CostAccrual = CostAccrual.PRORATED
+    initials: str | None = Field(default=None, max_length=64)
+    group: str | None = Field(default=None, max_length=255)
+    code: str | None = Field(default=None, max_length=255)
+    email: str | None = Field(default=None, max_length=255)
+    notes: str | None = Field(default=None, max_length=32000)
+    base_calendar: ObjectRef | None = None
 
     @model_validator(mode="after")
     def valid_type_fields(self) -> CreateResource:
+        _require_kind(self.base_calendar, ObjectKind.CALENDAR, "base_calendar")
         if self.resource_type == ResourceType.WORK and self.material_label is not None:
             raise ValueError("material_label is only valid for material resources")
         if self.resource_type == ResourceType.MATERIAL:
@@ -254,6 +357,8 @@ class CreateResource(ContractModel):
                 or self.material_label is not None
             ):
                 raise ValueError("cost resources do not accept units, rate, per-use, or material fields")
+        if self.resource_type != ResourceType.WORK and self.base_calendar is not None:
+            raise ValueError("base_calendar is only valid for work resources")
         return self
 
 
@@ -266,10 +371,18 @@ class UpdateResource(ContractModel):
     overtime_rate_per_hour: Decimal | None = Field(default=None, ge=0)
     cost_per_use: Decimal | None = Field(default=None, ge=0)
     material_label: str | None = Field(default=None, max_length=64)
+    cost_accrual: CostAccrual | None = None
+    initials: str | None = Field(default=None, max_length=64)
+    group: str | None = Field(default=None, max_length=255)
+    code: str | None = Field(default=None, max_length=255)
+    email: str | None = Field(default=None, max_length=255)
+    notes: str | None = Field(default=None, max_length=32000)
+    base_calendar: ObjectRef | None = None
 
     @model_validator(mode="after")
     def valid_update(self) -> UpdateResource:
         _require_kind(self.resource, ObjectKind.RESOURCE, "resource")
+        _require_kind(self.base_calendar, ObjectKind.CALENDAR, "base_calendar")
         values = (
             self.name,
             self.max_units_percent,
@@ -277,6 +390,13 @@ class UpdateResource(ContractModel):
             self.overtime_rate_per_hour,
             self.cost_per_use,
             self.material_label,
+            self.cost_accrual,
+            self.initials,
+            self.group,
+            self.code,
+            self.email,
+            self.notes,
+            self.base_calendar,
         )
         if all(value is None for value in values):
             raise ValueError("update_resource requires at least one changed field")
@@ -461,17 +581,63 @@ class UpdateProjectProperties(ContractModel):
     manager: str | None = Field(default=None, max_length=255)
     company: str | None = Field(default=None, max_length=255)
     subject: str | None = Field(default=None, max_length=255)
+    author: str | None = Field(default=None, max_length=255)
+    keywords: str | None = Field(default=None, max_length=255)
     comments: str | None = Field(default=None, max_length=4000)
     project_start: datetime | None = None
+    project_finish: datetime | None = None
+    schedule_from: ScheduleFrom | None = None
+    current_date: datetime | None = None
+    calendar: ObjectRef | None = None
+    priority: int | None = Field(default=None, ge=0, le=1000)
+    default_task_type: TaskType | None = None
+    default_effort_driven: bool | None = None
+    new_tasks_manual: bool | None = None
+    honor_constraints: bool | None = None
+    multiple_critical_paths: bool | None = None
+    hours_per_day: Decimal | None = Field(default=None, gt=0)
+    hours_per_week: Decimal | None = Field(default=None, gt=0)
+    days_per_month: Decimal | None = Field(default=None, gt=0)
 
-    @field_validator("project_start")
+    @field_validator("project_start", "project_finish", "current_date")
     @classmethod
-    def project_local_time(cls, value: datetime | None) -> datetime | None:
-        return _naive(value, "project_start")
+    def project_local_time(
+        cls, value: datetime | None, info: ValidationInfo
+    ) -> datetime | None:
+        return _naive(value, info.field_name)
 
     @model_validator(mode="after")
     def has_change(self) -> UpdateProjectProperties:
-        values = (self.title, self.manager, self.company, self.subject, self.comments, self.project_start)
+        _require_kind(self.calendar, ObjectKind.CALENDAR, "calendar")
+        if self.project_start is not None and self.project_finish is not None:
+            raise ValueError("project_start and project_finish cannot be changed together")
+        if self.project_start is not None and self.schedule_from == ScheduleFrom.FINISH:
+            raise ValueError("project_start requires schedule_from=start")
+        if self.project_finish is not None and self.schedule_from == ScheduleFrom.START:
+            raise ValueError("project_finish requires schedule_from=finish")
+        values = (
+            self.title,
+            self.manager,
+            self.company,
+            self.subject,
+            self.author,
+            self.keywords,
+            self.comments,
+            self.project_start,
+            self.project_finish,
+            self.schedule_from,
+            self.current_date,
+            self.calendar,
+            self.priority,
+            self.default_task_type,
+            self.default_effort_driven,
+            self.new_tasks_manual,
+            self.honor_constraints,
+            self.multiple_critical_paths,
+            self.hours_per_day,
+            self.hours_per_week,
+            self.days_per_month,
+        )
         if all(value is None for value in values):
             raise ValueError("update_project_properties requires at least one changed field")
         return self
@@ -523,6 +689,7 @@ class ProjectRequest(ContractModel):
     action: ProjectAction
     name: str | None = Field(default=None, min_length=1, max_length=255)
     path: str | None = None
+    template_path: str | None = None
     project: ProjectRef | None = None
     expected_state: ProjectState | None = None
     idempotency_key: str | None = Field(default=None, min_length=8, max_length=128)
@@ -534,6 +701,8 @@ class ProjectRequest(ContractModel):
         if self.action in {ProjectAction.CREATE, ProjectAction.OPEN, ProjectAction.ATTACH}:
             if self.idempotency_key is None:
                 raise ValueError("create, open, and attach require idempotency_key")
+        if self.template_path is not None and self.action != ProjectAction.CREATE:
+            raise ValueError("template_path is only valid for create")
         return self
 
 
